@@ -1,0 +1,946 @@
+<?php
+
+namespace App\Services\Cbt\Analysis;
+
+use App\Services\Cbt\Assessment\AssessmentEngineService;
+use App\Services\Cbt\Assessment\AssessmentStatusResolver;
+use App\Services\Cbt\Assessment\MasteryRateCalculator;
+use App\Services\Cbt\Assessment\TpEvidenceEvaluator;
+use App\Services\Cbt\Assessment\QuestionWeightResolver;
+use CodeIgniter\Database\BaseConnection;
+
+/**
+ * CbtTpAnalysisService
+ *
+ * ESPATA Assessment Intelligence V3 — Analisis Hasil Ujian Berbasis TP
+ * Menyederhanakan analisis hasil ujian menjadi dua fokus utama:
+ * 1. Analisis Penguasaan TP Per Siswa (Student TP Mastery)
+ * 2. Analisis Penguasaan TP Per Kelas (Cohort/Class TP Mastery)
+ *
+ * Aturan Perhitungan & Kebijakan Akademik:
+ * - Dasar analisis: Pemetaan soal objektif terhadap Tujuan Pembelajaran (TP) dan hasil jawaban siswa.
+ * - Penguasaan TP Siswa = (Skor diperoleh pada soal TP / Skor maksimal soal TP) * 100%.
+ * - Penguasaan TP Kelas = CR_murni = (Jumlah Siswa Dikuasai / Jumlah Siswa Dinilai Lengkap) * 100%.
+ * - Soal yang dibatalkan (is_void) tidak dihitung dalam bobot maupun skor.
+ * - Siswa yang belum mengikuti ujian (not attempted) tidak dihitung sebagai nol.
+ * - Ujian dengan koreksi esai yang belum selesai ditandai "Menunggu Koreksi Esai".
+ * - Isolasi OD-PATH-B: Nilai esai tidak dialokasikan secara sembarang ke TP.
+ * - Aturan konjungtif kecukupan bukti: Smax >= 10.00 dan N_unique >= 2.
+ *   Jika belum terpenuhi: "Belum cukup data untuk dianalisis".
+ */
+class CbtTpAnalysisService
+{
+    private ?BaseConnection $db;
+    private TpEvidenceEvaluator $tpEvaluator;
+    private MasteryRateCalculator $masteryCalculator;
+    private QuestionWeightResolver $weightResolver;
+
+    public const THRESHOLD_REMEDIAL = 75.0;
+    public const THRESHOLD_ENRICHMENT = 85.0;
+
+    public function __construct(
+        ?BaseConnection $db = null,
+        ?TpEvidenceEvaluator $tpEvaluator = null,
+        ?MasteryRateCalculator $masteryCalculator = null,
+        ?QuestionWeightResolver $weightResolver = null
+    ) {
+        $this->db = $db;
+        $this->tpEvaluator = $tpEvaluator ?? new TpEvidenceEvaluator();
+        $this->masteryCalculator = $masteryCalculator ?? new MasteryRateCalculator();
+        $this->weightResolver = $weightResolver ?? new QuestionWeightResolver();
+    }
+
+    /**
+     * Hitung skor normalisasi (0.0 sampai 1.0) untuk butir soal objektif.
+     * Mendukung PG biasa, PG Kompleks (PGK), dan Benar-Salah (BS).
+     */
+    public static function calculateNormalizedScore(string $type, string $studentAns, string $correctAns): float
+    {
+        $type = strtolower(str_replace(' ', '_', $type));
+        $studentAns = trim($studentAns);
+        $correctAns = trim($correctAns);
+
+        if ($studentAns === '' || $correctAns === '') {
+            return 0.0;
+        }
+
+        // Pilihan Ganda Tunggal (PG)
+        if (in_array($type, ['pg', 'pilihan_ganda', 'multiple_choice'], true)) {
+            $isCorrect = (strtoupper($studentAns) === strtoupper($correctAns));
+            if (!$isCorrect) {
+                $numToLetter = ['1' => 'A', '2' => 'B', '3' => 'C', '4' => 'D', '5' => 'E'];
+                if (isset($numToLetter[$correctAns]) && strtoupper($studentAns) === $numToLetter[$correctAns]) {
+                    return 1.0;
+                }
+                if (isset($numToLetter[$studentAns]) && $numToLetter[$studentAns] === strtoupper($correctAns)) {
+                    return 1.0;
+                }
+            }
+            return $isCorrect ? 1.0 : 0.0;
+        }
+
+        // Pilihan Ganda Kompleks (PGK)
+        if ($type === 'pg_kompleks' || $type === 'pgk') {
+            $correctArr = array_values(array_filter(array_map('trim', explode(',', strtoupper($correctAns)))));
+            $studentArr = array_values(array_filter(array_map('trim', explode(',', strtoupper($studentAns)))));
+            $cSel = count(array_intersect($studentArr, $correctArr));
+            $iSel = count(array_diff($studentArr, $correctArr));
+            $tCorr = count($correctArr);
+            $raw = $cSel - (0.5 * $iSel);
+            return ($tCorr > 0) ? (float)max(0.0, $raw / $tCorr) : 0.0;
+        }
+
+        // Benar-Salah (BS)
+        if ($type === 'benar_salah' || $type === 'bs') {
+            $cArr = array_values(array_filter(array_map('trim', explode(',', strtoupper($correctAns)))));
+            $sRaw = explode(',', strtoupper($studentAns));
+            $sArr = [];
+            foreach ($sRaw as $v) {
+                $tv = trim($v);
+                if ($tv !== '') {
+                    $sArr[] = $tv;
+                }
+            }
+            $matches = 0;
+            $tItems = count($cArr);
+            for ($i = 0; $i < $tItems; $i++) {
+                $std = $sArr[$i] ?? '';
+                $key = $cArr[$i] ?? '';
+                if ($std !== '' && $std === $key) {
+                    $matches++;
+                }
+            }
+            return ($tItems > 0) ? (float)($matches / $tItems) : 0.0;
+        }
+
+        return 0.0;
+    }
+
+    /**
+     * Dapatkan koneksi database secara aman.
+     */
+    protected function getDb(): BaseConnection
+    {
+        if ($this->db === null) {
+            $this->db = \Config\Database::connect();
+        }
+        return $this->db;
+    }
+
+    /**
+     * Jalankan analisis lengkap untuk sebuah paket ujian (test_id) dari database.
+     *
+     * @param int $testId ID sesi ujian (cbt_test_status.id)
+     * @return array Hasil analisis terstruktur (Per Siswa dan Per Kelas)
+     */
+    public function analyzeTest(int $testId): array
+    {
+        $db = $this->getDb();
+
+        // 1. Ambil informasi ujian
+        $test = $db->table('cbt_test_status ts')
+            ->select('ts.*, qb.code AS bank_code, qb.subject_id, qb.level AS bank_level, s.name AS subject_name, en.name AS exam_name')
+            ->join('cbt_question_banks qb', 'qb.id = ts.bank_id', 'left')
+            ->join('subjects s', 's.id = qb.subject_id', 'left')
+            ->join('cbt_exam_names en', 'en.id = ts.exam_name_id', 'left')
+            ->where('ts.id', $testId)
+            ->get()->getRowArray();
+
+        // Fallback untuk ujian legacy/langsung via bank soal
+        if (!$test && $db->tableExists('cbt_question_banks')) {
+            $qb = $db->table('cbt_question_banks qb')
+                ->select('qb.id as bank_id, qb.code as bank_code, qb.subject_id, qb.level as bank_level, qb.teacher_id, s.name as subject_name')
+                ->join('subjects s', 's.id = qb.subject_id', 'left')
+                ->where('qb.id', $testId)
+                ->get()->getRowArray();
+            if ($qb) {
+                $test = [
+                    'id'           => $testId,
+                    'test_id'      => $testId,
+                    'bank_id'      => $qb['bank_id'],
+                    'bank_code'    => $qb['bank_code'],
+                    'bank_level'   => $qb['bank_level'],
+                    'subject_id'   => $qb['subject_id'],
+                    'subject_name' => $qb['subject_name'] ?? 'Mata Pelajaran',
+                    'exam_name'    => 'Ujian CBT (' . $qb['bank_code'] . ')',
+                    'class_codes'  => '',
+                    'semester'     => 1,
+                ];
+            }
+        }
+
+        if (!$test) {
+            throw new \RuntimeException("Ujian CBT #{$testId} tidak ditemukan.");
+        }
+
+        // 2. Ambil seluruh soal di bank soal
+        $questions = $db->table('cbt_questions')
+            ->where('bank_id', (int)$test['bank_id'])
+            ->orderBy('id', 'ASC')
+            ->get()->getResultArray();
+
+        // Ambil info pembatalan soal dari cbt_test_item_versions jika tersedia
+        $voidMap = [];
+        $tpMap = [];
+        if ($db->tableExists('cbt_test_items') && $db->tableExists('cbt_test_item_versions')) {
+            $versions = $db->table('cbt_test_items ti')
+                ->select('ti.bank_question_id, tiv.is_active, tiv.content_payload_json')
+                ->join('cbt_test_item_versions tiv', 'tiv.test_item_id = ti.id AND tiv.test_id = ti.test_id', 'inner')
+                ->where('ti.test_id', $testId)
+                ->get()->getResultArray();
+
+            foreach ($versions as $v) {
+                $qid = (int)$v['bank_question_id'];
+                if (isset($v['is_active']) && (int)$v['is_active'] === 0) {
+                    $voidMap[$qid] = true;
+                }
+                if (!empty($v['content_payload_json'])) {
+                    $payload = json_decode($v['content_payload_json'], true);
+                    if (is_array($payload) && !empty($payload['tp_id'])) {
+                        $tpMap[$qid] = (int)$payload['tp_id'];
+                    }
+                }
+            }
+        }
+
+        // Ambil konfigurasi pemetaan materi & TP (Formatif / Sumatif) jika telah diselaraskan
+        $tpConfig = null;
+        $selectedTpIds = [];
+        $isConfigured = false;
+        if ($db->tableExists('cbt_test_tp_configs')) {
+            $tpConfig = $db->table('cbt_test_tp_configs')->where('test_id', $testId)->get()->getRowArray();
+            if ($tpConfig && !empty($tpConfig['selected_tp_ids'])) {
+                $decoded = json_decode($tpConfig['selected_tp_ids'], true);
+                if (is_array($decoded) && !empty($decoded)) {
+                    $selectedTpIds = array_map('intval', $decoded);
+                    $isConfigured = true;
+                }
+            }
+        }
+
+        // Ambil pemetaan eksplisit dari tabel cbt_test_tp_mappings
+        if ($db->tableExists('cbt_test_tp_mappings')) {
+            $explicitMappings = $db->table('cbt_test_tp_mappings')
+                ->where('test_id', $testId)
+                ->get()->getResultArray();
+            foreach ($explicitMappings as $em) {
+                $qid = (int)$em['question_id'];
+                $tpMap[$qid] = (int)$em['tp_id'];
+            }
+        }
+
+        // Jika selectedTpIds belum terisi tetapi soal sudah dipetakan, ambil TP unik dari pemetaan
+        if (empty($selectedTpIds) && !empty($tpMap)) {
+            $selectedTpIds = array_values(array_unique(array_filter(array_map('intval', $tpMap))));
+            if (!empty($selectedTpIds)) {
+                $isConfigured = true;
+            }
+        }
+
+        // 3. Ambil daftar Tujuan Pembelajaran (TP) untuk mata pelajaran ini
+        $subjectId = (int)($test['subject_id'] ?? 0);
+        $tps = [];
+        if ($db->tableExists('tujuan_pembelajaran') && $subjectId > 0) {
+            $tpQuery = $db->table('tujuan_pembelajaran')
+                ->where('subject_id', $subjectId);
+
+            // Jika guru telah memilih TP tertentu (Formatif/Sumatif), batasi hanya pada TP tersebut!
+            if ($isConfigured && !empty($selectedTpIds)) {
+                $tpQuery->whereIn('id', $selectedTpIds);
+            }
+
+            $tps = $tpQuery->orderBy('kode_tp', 'ASC')
+                ->orderBy('id', 'ASC')
+                ->get()->getResultArray();
+        }
+
+        // Ambil ambang batas KKTP bila ada
+        $thresholds = [];
+        if ($db->tableExists('kktp') && $subjectId > 0) {
+            $kktpRows = $db->table('kktp')
+                ->where('subject_id', $subjectId)
+                ->get()->getResultArray();
+            foreach ($kktpRows as $k) {
+                $tpId = (int)($k['tp_id'] ?? 0);
+                if ($tpId > 0 && !empty($k['kriteria_3_interval'])) {
+                    // Ekstrak angka batas bawah, misal "66-85%" -> 66
+                    if (preg_match('/(\d+)/', $k['kriteria_3_interval'], $m)) {
+                        $thresholds[$tpId] = (float)$m[1];
+                    }
+                }
+            }
+        }
+
+        // 4. Susun TP Definitions dan petakan soal ke TP
+        $tpDefinitions = [];
+        $tpIdList = [];
+        if (!empty($tps)) {
+            foreach ($tps as $tp) {
+                $id = (int)$tp['id'];
+                $tpIdList[] = $id;
+                $tpDefinitions[] = [
+                    'tp_id'     => $id,
+                    'tp_code'   => !empty($tp['kode_tp']) ? 'TP ' . $tp['kode_tp'] : 'TP #' . $id,
+                    'deskripsi' => $tp['deskripsi'] ?? '',
+                    'threshold' => $thresholds[$id] ?? self::THRESHOLD_REMEDIAL,
+                ];
+            }
+        }
+
+        // Petakan soal ke TP
+        $items = [];
+        $totalObj = 0;
+        foreach ($questions as $idx => $q) {
+            $qid = (int)$q['id'];
+            $type = strtolower((string)($q['question_type'] ?? 'pg'));
+            $isVoid = !empty($voidMap[$qid]);
+
+            // Tentukan tp_id untuk soal ini
+            $assignedTpId = $tpMap[$qid] ?? null;
+            if ($assignedTpId === null && !empty($tpIdList)) {
+                // Jika belum dipetakan eksplisit di payload, distribusikan secara seimbang ke TP yang tersedia
+                $assignedTpId = $tpIdList[$idx % count($tpIdList)];
+            }
+
+            $items[] = [
+                'item_id'       => $qid,
+                'question_text' => $q['raw_text'] ?? ($q['question_text'] ?? ''),
+                'type'          => $type,
+                'tp_id'         => $assignedTpId,
+                'key'           => !empty($q['correct_option']) ? $q['correct_option'] : ($q['correct_answer'] ?? ''),
+                'score'         => (float)($q['score'] ?? 1.0),
+                'is_void'       => $isVoid,
+            ];
+
+            if (!$isVoid && $type !== 'esai') {
+                $totalObj++;
+            }
+        }
+
+        // Dapatkan tahun ajaran aktif
+        $activeYearId = 0;
+        $activeYearLabel = '';
+        if ($db->tableExists('academic_years')) {
+            $ay = $db->table('academic_years')->where('is_active', 1)->get()->getRowArray();
+            if (!$ay) {
+                $ay = $db->table('academic_years')->orderBy('start_date', 'DESC')->get()->getRowArray();
+            }
+            if ($ay) {
+                $activeYearId = (int) ($ay['id'] ?? 0);
+                $activeYearLabel = (string) ($ay['year'] ?? '');
+            }
+        }
+
+        // 5. Ambil data sesi pengerjaan siswa
+        $sessionQuery = $db->table('cbt_sessions s')
+            ->select('s.*, st.name as student_name, st.nisn, st.nis, 
+                      sc.score_pg, sc.score_esai, sc.final_score, sc.pending_essay_count, sc.publication_eligibility')
+            ->join('students st', 'st.id = s.student_id', 'left')
+            ->join('cbt_session_scores_v3 sc', 'sc.session_id = s.id', 'left')
+            ->where('s.test_id', $testId)
+            ->groupBy('s.id')
+            ->orderBy('st.name', 'ASC');
+
+        $sessions = $sessionQuery->get()->getResultArray();
+
+        // 6. Ambil jawaban seluruh siswa untuk test ini
+        $answers = [];
+        if ($db->tableExists('cbt_answers')) {
+            $answers = $db->table('cbt_answers')
+                ->where('test_id', $testId)
+                ->get()->getResultArray();
+        }
+
+        // Fallback: Jika sessions belum ada tetapi ada jawaban siswa di cbt_answers
+        if (empty($sessions) && !empty($answers) && $db->tableExists('students')) {
+            $studentIds = array_unique(array_filter(array_column($answers, 'student_id')));
+            if (!empty($studentIds)) {
+                $students = $db->table('students')
+                    ->whereIn('id', $studentIds)
+                    ->get()->getResultArray();
+                foreach ($students as $st) {
+                    $sessions[] = [
+                        'id'           => (int)$st['id'],
+                        'student_id'   => (int)$st['id'],
+                        'student_name' => $st['name'],
+                        'nisn'         => $st['nisn'] ?? '-',
+                        'nis'          => $st['nis'] ?? '-',
+                        'class_name'   => '-',
+                        'status'       => 'FINISHED',
+                        'started_at'   => date('Y-m-d H:i:s'),
+                    ];
+                }
+            }
+        }
+
+        // 7. Resolusi kelas siswa akurat sesuai Tahun Ajaran Aktif
+        $allStudentIds = array_values(array_unique(array_filter(array_map('intval', array_column($sessions, 'student_id')))));
+        $classMap = $this->resolveStudentClasses($allStudentIds, $activeYearId);
+        foreach ($sessions as &$sess) {
+            $sid = (int)($sess['student_id'] ?? 0);
+            $sess['class_name'] = $classMap[$sid] ?? ($sess['class_name'] ?? '-');
+        }
+        unset($sess);
+
+        // Resolusi sasaran kelas ujian jika belum terdefinisi
+        if (empty($test['class_codes'])) {
+            if (!empty($tpConfig['selected_atp_ids']) && $db->tableExists('alur_tujuan_pembelajaran') && $db->tableExists('classes')) {
+                $atpIds = json_decode((string)$tpConfig['selected_atp_ids'], true) ?: [];
+                if (!empty($atpIds)) {
+                    $atpClasses = $db->table('alur_tujuan_pembelajaran atp')
+                        ->select('c.name as class_name')
+                        ->join('classes c', 'c.id = atp.class_id', 'inner')
+                        ->whereIn('atp.id', $atpIds)
+                        ->get()->getResultArray();
+                    $classNames = array_unique(array_filter(array_column($atpClasses, 'class_name')));
+                    if (!empty($classNames)) {
+                        $test['class_codes'] = implode(', ', $classNames);
+                    }
+                }
+            }
+            if (empty($test['class_codes']) && $db->tableExists('cbt_bap_documents_v3')) {
+                $bapDoc = $db->table('cbt_bap_documents_v3')
+                    ->where('test_id', $testId)
+                    ->orderBy('id', 'DESC')
+                    ->get()->getRowArray();
+                if (!empty($bapDoc['room_code'])) {
+                    $test['class_codes'] = $bapDoc['room_code'];
+                }
+            }
+            if (empty($test['class_codes']) && !empty($classMap)) {
+                $uniqueClasses = array_unique(array_filter(array_values($classMap), fn($c) => $c !== '-'));
+                if (!empty($uniqueClasses)) {
+                    $test['class_codes'] = implode(', ', $uniqueClasses);
+                }
+            }
+        }
+
+        $testConfig = [
+            'test_id'        => $testId,
+            'name'           => $test['exam_name'] ?? ('Ujian #' . $testId),
+            'subject_name'   => $test['subject_name'] ?? 'Mata Pelajaran',
+            'bank_code'      => $test['bank_code'] ?? '-',
+            'class_codes'    => $test['class_codes'] ?? '',
+            'academic_year'  => $activeYearLabel,
+            'passing_grade'  => self::THRESHOLD_REMEDIAL,
+            'tp_definitions' => $tpDefinitions,
+            'tp_mapping_info'=> [
+                'is_configured'   => $isConfigured,
+                'assessment_type' => $tpConfig['assessment_type'] ?? null,
+                'selected_atp_ids'=> !empty($tpConfig['selected_atp_ids']) ? (json_decode($tpConfig['selected_atp_ids'], true) ?: []) : [],
+                'selected_tp_ids' => $selectedTpIds,
+                'total_mapped'    => count($tpMap),
+            ],
+        ];
+
+        return $this->analyzeFromData($testConfig, $items, $sessions, $answers);
+    }
+
+    /**
+     * Mesin kalkulasi murni (dapat diuji secara terisolasi tanpa database operasional).
+     *
+     * @param array $testConfig Konfigurasi ujian & definisi TP
+     * @param array $items Daftar butir soal beserta tipe, bobot, is_void, dan tp_id
+     * @param array $sessions Daftar sesi siswa (termasuk status sesi & pending_essay_count)
+     * @param array $answers Daftar jawaban siswa (session_id, question_id, answer)
+     * @return array Hasil analisis Penguasaan TP Per Siswa dan Per Kelas
+     */
+    public function analyzeFromData(
+        array $testConfig,
+        array $items,
+        array $sessions,
+        array $answers
+    ): array {
+        $tpDefinitions = $testConfig['tp_definitions'] ?? [];
+        $defaultThreshold = (float)($testConfig['passing_grade'] ?? self::THRESHOLD_REMEDIAL);
+
+        // Jika TP definitions kosong, buat entri fallback agar laporan tetap informatif
+        if (empty($tpDefinitions)) {
+            $tpDefinitions = [
+                [
+                    'tp_id'     => 1,
+                    'tp_code'   => 'TP Umum',
+                    'deskripsi' => 'Penguasaan materi umum ' . ($testConfig['subject_name'] ?? 'mata pelajaran'),
+                    'threshold' => $defaultThreshold,
+                ]
+            ];
+            // Petakan semua soal ke TP fallback
+            foreach ($items as &$it) {
+                if (empty($it['tp_id'])) {
+                    $it['tp_id'] = 1;
+                }
+            }
+            unset($it);
+        }
+
+        // Resolusi bobot soal objektif agar total bobot valid terdistribusi ke 100%
+        $activeObjectiveItems = [];
+        foreach ($items as $item) {
+            $type = strtolower((string)($item['type'] ?? 'pg'));
+            if ($type !== 'esai' && empty($item['is_void'])) {
+                $activeObjectiveItems[] = $item;
+            }
+        }
+
+        $totalActiveObj = count($activeObjectiveItems);
+        $weightPerItem = $totalActiveObj > 0 ? (100.0 / $totalActiveObj) : 0.0;
+
+        $decoratedItems = [];
+        foreach ($items as $item) {
+            $type = strtolower((string)($item['type'] ?? 'pg'));
+            $isVoid = !empty($item['is_void']);
+            $weight = ($type !== 'esai' && !$isVoid) ? $weightPerItem : 0.0;
+
+            $decoratedItems[$item['item_id']] = array_merge($item, [
+                'resolved_weight' => $weight,
+            ]);
+        }
+
+        // Kelompokkan jawaban berdasarkan session_id dan student_id
+        $answersBySession = [];
+        $answersByStudent = [];
+        foreach ($answers as $ans) {
+            $sessId = (int)($ans['session_id'] ?? 0);
+            $studId = (int)($ans['student_id'] ?? 0);
+            $qid = (int)($ans['question_id'] ?? ($ans['item_id'] ?? 0));
+            $ansText = (string)($ans['answer'] ?? ($ans['student_answer'] ?? ''));
+
+            if ($sessId > 0) {
+                $answersBySession[$sessId][$qid] = $ansText;
+            }
+            if ($studId > 0) {
+                $answersByStudent[$studId][$qid] = $ansText;
+            }
+        }
+
+        // =========================================================================
+        // 1. ANALISIS PENGUASAAN TP PER SISWA
+        // =========================================================================
+        $studentReports = [];
+        $cohortEvaluations = [];
+        $totalEvaluatedStudents = 0;
+        $totalRegisteredStudents = count($sessions);
+        $pendingEssayStudentsCount = 0;
+
+        foreach ($sessions as $session) {
+            $studentId = (int)($session['student_id'] ?? 0);
+            $sessionId = (int)($session['id'] ?? ($session['session_id'] ?? 0));
+            $studentName = $session['student_name'] ?? ('Siswa #' . $studentId);
+            $nisn = $session['nisn'] ?? ($session['nis'] ?? '-');
+            $className = $session['class_name'] ?? '-';
+            $sessionStatus = strtoupper((string)($session['status'] ?? ($session['session_status'] ?? 'SUBMITTED')));
+            $pendingEssayCount = (int)($session['pending_essay_count'] ?? 0);
+
+            // Cari jawaban siswa (prioritas session_id, fallback ke student_id)
+            $studentAnswers = $answersBySession[$sessionId] ?? ($answersByStudent[$studentId] ?? []);
+
+            // Siswa yang belum ujian atau absen
+            $isAbsentOrUnattempted = in_array($sessionStatus, ['ABSENT', 'NOT_ATTEMPTED', 'BELUM_MENGERJAKAN'], true);
+            $hasAttempted = !$isAbsentOrUnattempted && (!empty($session['started_at']) || !empty($studentAnswers) || in_array($sessionStatus, ['FINISHED', 'SUBMITTED', 'ACTIVE'], true));
+
+            $isEssayPending = ($pendingEssayCount > 0);
+            if ($isEssayPending) {
+                $pendingEssayStudentsCount++;
+            }
+
+            // Identifikasi butir soal yang disajikan untuk sesi siswa ini
+            $sessionQOrder = !empty($session['question_order']) ? json_decode((string)$session['question_order'], true) : [];
+            $presentedQids = [];
+            if (is_array($sessionQOrder) && !empty($sessionQOrder)) {
+                $presentedQids = array_map('intval', $sessionQOrder);
+            } elseif (!empty($studentAnswers)) {
+                $presentedQids = array_map('intval', array_keys($studentAnswers));
+            } else {
+                $presentedQids = array_map('intval', array_keys($decoratedItems));
+            }
+
+            // Hitung butir soal objektif valid yang disajikan untuk siswa ini
+            $studentActiveObjItems = [];
+            foreach ($decoratedItems as $itemId => $item) {
+                $type = strtolower((string)($item['type'] ?? 'pg'));
+                if ($type === 'esai' || !empty($item['is_void'])) {
+                    continue;
+                }
+                if (in_array((int)$itemId, $presentedQids, true)) {
+                    $studentActiveObjItems[(int)$itemId] = $item;
+                }
+            }
+
+            // Jika siswa belum disajikan soal (misal belum ujian), gunakan semua soal objektif sebagai acuan struktur
+            if (empty($studentActiveObjItems)) {
+                foreach ($decoratedItems as $itemId => $item) {
+                    $type = strtolower((string)($item['type'] ?? 'pg'));
+                    if ($type !== 'esai' && empty($item['is_void'])) {
+                        $studentActiveObjItems[(int)$itemId] = $item;
+                    }
+                }
+            }
+
+            $studentTotalObj = count($studentActiveObjItems);
+            // Bobot per butir soal objektif agar total skor objektif siswa berskala 100%
+            $studentWeightPerItem = $studentTotalObj > 0 ? (100.0 / $studentTotalObj) : 0.0;
+
+            // Evaluasi per butir soal untuk siswa ini menggunakan engine scoring CBT terpadu
+            $studentItemBreakdown = [];
+            foreach ($studentActiveObjItems as $itemId => $item) {
+                $type = strtolower((string)($item['type'] ?? 'pg'));
+                $key = (string)($item['key'] ?? '');
+                $givenAnswer = (string)($studentAnswers[$itemId] ?? '');
+
+                $normScore = self::calculateNormalizedScore($type, $givenAnswer, $key);
+                $earnedWeight = $normScore * $studentWeightPerItem;
+
+                $studentItemBreakdown[] = [
+                    'item_id'          => $itemId,
+                    'tp_id'            => $item['tp_id'] ?? null,
+                    'weight'           => $studentWeightPerItem,
+                    'earned_weight'    => $earnedWeight,
+                    'weighted_score'   => $earnedWeight,
+                    'is_void'          => !empty($item['is_void']),
+                    'is_correct'       => ($normScore >= 0.7),
+                    'normalized_score' => $normScore,
+                ];
+            }
+
+            // Evaluasi TP menggunakan TpEvidenceEvaluator
+            $tpEvals = $this->tpEvaluator->evaluate($studentItemBreakdown, $tpDefinitions, $hasAttempted);
+
+            $masteredTpCodes = [];
+            $needsImprovementTpCodes = [];
+            $insufficientTpCodes = [];
+            $allMastered = true;
+            $hasDefinitive = false;
+            $hasAnyFail = false;
+            $totalScoreSum = 0.0;
+            $evalCount = 0;
+
+            foreach ($tpEvals as $tpId => &$eval) {
+                $status = $eval['status'] ?? AssessmentStatusResolver::TP_INSUFFICIENT_EVIDENCE;
+                $tpCode = $eval['tp_code'] ?? ('TP #' . $tpId);
+
+                // Tambahkan label deskriptif ramah guru
+                if ($status === AssessmentStatusResolver::TP_MASTERED) {
+                    $eval['status_label'] = 'Dikuasai';
+                    $eval['badge_class'] = 'bg-success';
+                    $masteredTpCodes[] = $tpCode;
+                    $hasDefinitive = true;
+                } elseif ($status === AssessmentStatusResolver::TP_NOT_MASTERED) {
+                    $eval['status_label'] = 'Perlu Peningkatan';
+                    $eval['badge_class'] = 'bg-warning text-dark';
+                    $needsImprovementTpCodes[] = $tpCode;
+                    $allMastered = false;
+                    $hasAnyFail = true;
+                    $hasDefinitive = true;
+                } elseif ($status === AssessmentStatusResolver::TP_NOT_ATTEMPTED) {
+                    $eval['status_label'] = 'Belum Mengerjakan';
+                    $eval['badge_class'] = 'bg-light text-muted border';
+                    $allMastered = false;
+                } else {
+                    $eval['status_label'] = 'Belum cukup data untuk dianalisis';
+                    $eval['badge_class'] = 'bg-secondary';
+                    $insufficientTpCodes[] = $tpCode;
+                    $allMastered = false;
+                }
+
+                if ($eval['student_percentage'] !== null) {
+                    $totalScoreSum += $eval['student_percentage'];
+                    $evalCount++;
+                }
+            }
+            unset($eval);
+
+            // Tentukan rekomendasi tindak lanjut siswa
+            $avgTpScore = $evalCount > 0 ? round($totalScoreSum / $evalCount, 1) : null;
+            $recommendation = '-';
+            $recommendationBadge = 'bg-secondary';
+
+            if (!$hasAttempted) {
+                $recommendation = 'Ujian Susulan';
+                $recommendationBadge = 'bg-light text-muted border';
+            } elseif ($isEssayPending) {
+                $recommendation = 'Menunggu Koreksi Esai';
+                $recommendationBadge = 'bg-info text-dark';
+            } elseif ($hasAnyFail) {
+                $recommendation = 'Remedial (' . implode(', ', $needsImprovementTpCodes) . ')';
+                $recommendationBadge = 'bg-danger';
+            } elseif ($hasDefinitive) {
+                $recommendation = ($avgTpScore !== null && $avgTpScore >= self::THRESHOLD_ENRICHMENT)
+                    ? 'Pengayaan'
+                    : 'Tuntas';
+                $recommendationBadge = 'bg-success';
+            } elseif (!empty($insufficientTpCodes)) {
+                $recommendation = 'Belum cukup data untuk dianalisis';
+                $recommendationBadge = 'bg-secondary';
+            }
+
+            if ($hasAttempted && !$isEssayPending) {
+                $totalEvaluatedStudents++;
+                // Hanya siswa dengan hasil penilaian sah dan lengkap yang masuk ke perhitungan kohor kelas (Aturan 3 & 7)
+                $cohortEvaluations[] = [
+                    'student_id'     => $studentId,
+                    'tp_evaluations' => $tpEvals,
+                ];
+            }
+
+            $studentReports[] = [
+                'student_id'             => $studentId,
+                'session_id'             => $sessionId,
+                'nama_siswa'             => $studentName,
+                'nisn'                   => $nisn,
+                'kelas'                  => $className,
+                'exam_score'             => ($session['final_score'] ?? ($session['total_score'] ?? ($session['score'] ?? null))),
+                'has_attempted'          => $hasAttempted,
+                'is_essay_pending'       => $isEssayPending,
+                'pending_essay_count'    => $pendingEssayCount,
+                'tp_evaluations'         => $tpEvals,
+                'mastered_tps'           => $masteredTpCodes,
+                'needs_improvement_tps'  => $needsImprovementTpCodes,
+                'insufficient_tps'       => $insufficientTpCodes,
+                'average_percentage'     => $avgTpScore,
+                'recommendation'         => $recommendation,
+                'recommendation_badge'   => $recommendationBadge,
+            ];
+        }
+
+        // =========================================================================
+        // 2. ANALISIS PENGUASAAN TP PER KELAS
+        // =========================================================================
+        $cohortMetricsRaw = $this->masteryCalculator->calculateCohort($cohortEvaluations);
+
+        $tpClassMetrics = [];
+        $topTp = null;
+        $lowestTp = null;
+        $maxCr = -1.0;
+        $minCr = 101.0;
+        $tpsNeedingReinforcement = [];
+
+        foreach ($tpDefinitions as $tpDef) {
+            $tpId = $tpDef['tp_id'];
+            $metric = $cohortMetricsRaw[$tpId] ?? null;
+
+            // Hitung jumlah soal valid & Smax untuk TP ini
+            $validQuestionsForTp = 0;
+            $sMaxForTp = 0.0;
+            foreach ($decoratedItems as $it) {
+                if ((int)($it['tp_id'] ?? 0) === (int)$tpId && empty($it['is_void']) && ($it['type'] ?? '') !== 'esai') {
+                    $validQuestionsForTp++;
+                    $sMaxForTp += (float)$it['resolved_weight'];
+                }
+            }
+
+            $threshold = (float)($tpDef['threshold'] ?? $defaultThreshold);
+            $crMurni = $metric['cr_murni'] ?? null;
+            $masteredCount = (int)($metric['mastered_count'] ?? 0);
+            $notMasteredCount = (int)($metric['not_mastered_count'] ?? 0);
+            $definitiveCount = (int)($metric['definitive_count'] ?? 0);
+            $hasDefinitive = !empty($metric['has_definitive_evidence']);
+
+            // Tentukan status kelas
+            $isSufficientEvidence = ($sMaxForTp >= TpEvidenceEvaluator::MIN_SMAX && $validQuestionsForTp >= TpEvidenceEvaluator::MIN_N_UNIQUE);
+
+            if (!$isSufficientEvidence || !$hasDefinitive) {
+                $statusKelas = 'BELUM_CUKUP_DATA';
+                $statusLabel = 'Belum cukup data untuk dianalisis';
+                $badgeClass  = 'bg-secondary';
+                $actionNote  = 'Perlu tambahan butir soal valid yang mengukur TP ini.';
+            } elseif ($crMurni !== null && $crMurni >= $threshold) {
+                $statusKelas = 'TUNTAS';
+                $statusLabel = 'Penguasaan Baik (Tuntas)';
+                $badgeClass  = 'bg-success';
+                $actionNote  = 'Penguasaan kelas sudah baik. Dapat dilanjutkan ke materi pengayaan atau TP berikutnya.';
+            } else {
+                $statusKelas = 'PERLU_PENGUATAN';
+                $statusLabel = 'Perlu Penguatan Pembelajaran';
+                $badgeClass  = 'bg-danger';
+                $actionNote  = 'TP ini belum dikuasai mayoritas kelas. Perlu mendapat penguatan materi dalam pembelajaran remedial kelas.';
+                $tpsNeedingReinforcement[] = [
+                    'tp_id'      => $tpId,
+                    'tp_code'    => $tpDef['tp_code'],
+                    'deskripsi'  => $tpDef['deskripsi'],
+                    'percentage' => $crMurni,
+                    'threshold'  => $threshold,
+                ];
+            }
+
+            // Lacak TP tertinggi & terendah (hanya dari yang memiliki data sah)
+            if ($crMurni !== null && $isSufficientEvidence) {
+                if ($crMurni > $maxCr) {
+                    $maxCr = $crMurni;
+                    $topTp = [
+                        'tp_id'      => $tpId,
+                        'tp_code'    => $tpDef['tp_code'],
+                        'deskripsi'  => $tpDef['deskripsi'] ?? '',
+                        'percentage' => $crMurni,
+                    ];
+                }
+                if ($crMurni < $minCr) {
+                    $minCr = $crMurni;
+                    $lowestTp = [
+                        'tp_id'      => $tpId,
+                        'tp_code'    => $tpDef['tp_code'],
+                        'deskripsi'  => $tpDef['deskripsi'] ?? '',
+                        'percentage' => $crMurni,
+                    ];
+                }
+            }
+
+            $tpClassMetrics[$tpId] = [
+                'tp_id'                => $tpId,
+                'tp_code'              => $tpDef['tp_code'],
+                'deskripsi'            => $tpDef['deskripsi'] ?? '',
+                'threshold'            => $threshold,
+                'valid_question_count' => $validQuestionsForTp,
+                's_max'                => round($sMaxForTp, 2),
+                'is_sufficient_evidence' => $isSufficientEvidence,
+                'mastered_count'       => $masteredCount,
+                'not_mastered_count'   => $notMasteredCount,
+                'definitive_count'     => $definitiveCount,
+                'cr_murni'             => $crMurni,
+                'cr_kohort'            => $metric['cr_kohort'] ?? null,
+                'status'               => $statusKelas,
+                'status_label'         => $statusLabel,
+                'badge_class'          => $badgeClass,
+                'action_note'          => $actionNote,
+            ];
+        }
+
+        $classAnalysis = [
+            'total_registered'            => $totalRegisteredStudents,
+            'total_evaluated'             => $totalEvaluatedStudents,
+            'pending_essay_student_count' => $pendingEssayStudentsCount,
+            'has_pending_essays'          => ($pendingEssayStudentsCount > 0),
+            'default_threshold'           => $defaultThreshold,
+            'tp_metrics'                  => $tpClassMetrics,
+            'top_tp'                      => $topTp,
+            'lowest_tp'                   => $lowestTp,
+            'tps_needing_reinforcement'   => $tpsNeedingReinforcement,
+            'calculation_base_note'       => sprintf(
+                'Perhitungan didasarkan pada %d siswa dengan hasil penilaian sah dan lengkap (dari %d siswa terdaftar).',
+                $totalEvaluatedStudents,
+                $totalRegisteredStudents
+            ),
+        ];
+
+        return [
+            'test_config'      => $testConfig,
+            'tp_definitions'   => $tpDefinitions,
+            'items_count'      => count($items),
+            'valid_items_count'=> count($activeObjectiveItems),
+            'student_analysis' => $studentReports,
+            'class_analysis'   => $classAnalysis,
+            'tp_mapping_info'  => $testConfig['tp_mapping_info'] ?? [
+                'is_configured'   => false,
+                'assessment_type' => null,
+                'selected_atp_ids'=> [],
+                'selected_tp_ids' => [],
+                'total_mapped'    => 0,
+            ],
+            'analyzed_at'      => date('Y-m-d H:i:s'),
+        ];
+    }
+
+    /**
+     * Resolusi nama kelas siswa berdasarkan Tahun Ajaran Aktif.
+     *
+     * Prioritas:
+     * 1. Record di student_records pada tahun ajaran aktif dengan status 'aktif'.
+     * 2. Record di student_records pada tahun ajaran aktif (apapun statusnya, misal 'lulus').
+     * 3. Record terbaru di student_records dengan status 'aktif'.
+     * 4. Field class_id langsung pada tabel students.
+     * 5. '-' jika tidak ditemukan.
+     *
+     * @param array $studentIds Daftar ID siswa
+     * @param int $activeYearId ID tahun ajaran aktif (0 = auto-resolve)
+     * @return array Map [student_id => class_name]
+     */
+    public function resolveStudentClasses(array $studentIds, int $activeYearId = 0): array
+    {
+        $studentIds = array_values(array_unique(array_filter(array_map('intval', $studentIds))));
+        if (empty($studentIds)) {
+            return [];
+        }
+
+        $db = $this->getDb();
+        $classMap = [];
+
+        if ($activeYearId === 0 && $db->tableExists('academic_years')) {
+            $ay = $db->table('academic_years')->where('is_active', 1)->get()->getRowArray();
+            if (!$ay) {
+                $ay = $db->table('academic_years')->orderBy('start_date', 'DESC')->get()->getRowArray();
+            }
+            if ($ay) {
+                $activeYearId = (int) ($ay['id'] ?? 0);
+            }
+        }
+
+        if ($db->tableExists('student_records') && $db->tableExists('classes')) {
+            // Level 1: Tahun ajaran aktif dengan status 'aktif'
+            if ($activeYearId > 0) {
+                $rows = $db->table('student_records sr')
+                    ->select('sr.student_id, c.name as class_name')
+                    ->join('classes c', 'c.id = sr.class_id', 'inner')
+                    ->whereIn('sr.student_id', $studentIds)
+                    ->where('sr.academic_year_id', $activeYearId)
+                    ->where('sr.status', 'aktif')
+                    ->get()->getResultArray();
+                foreach ($rows as $r) {
+                    $classMap[(int)$r['student_id']] = $r['class_name'];
+                }
+            }
+
+            // Level 2: Tahun ajaran aktif (apapun statusnya)
+            $missing = array_diff($studentIds, array_keys($classMap));
+            if (!empty($missing) && $activeYearId > 0) {
+                $rows = $db->table('student_records sr')
+                    ->select('sr.student_id, c.name as class_name')
+                    ->join('classes c', 'c.id = sr.class_id', 'inner')
+                    ->whereIn('sr.student_id', $missing)
+                    ->where('sr.academic_year_id', $activeYearId)
+                    ->get()->getResultArray();
+                foreach ($rows as $r) {
+                    $sid = (int)$r['student_id'];
+                    if (!isset($classMap[$sid])) {
+                        $classMap[$sid] = $r['class_name'];
+                    }
+                }
+            }
+
+            // Level 3: Record terbaru dengan status 'aktif'
+            $missing = array_diff($studentIds, array_keys($classMap));
+            if (!empty($missing)) {
+                $rows = $db->table('student_records sr')
+                    ->select('sr.student_id, c.name as class_name')
+                    ->join('classes c', 'c.id = sr.class_id', 'inner')
+                    ->whereIn('sr.student_id', $missing)
+                    ->where('sr.status', 'aktif')
+                    ->orderBy('sr.academic_year_id', 'DESC')
+                    ->orderBy('sr.id', 'DESC')
+                    ->get()->getResultArray();
+                foreach ($rows as $r) {
+                    $sid = (int)$r['student_id'];
+                    if (!isset($classMap[$sid])) {
+                        $classMap[$sid] = $r['class_name'];
+                    }
+                }
+            }
+        }
+
+        // Level 4: Fallback ke students.class_id
+        $missing = array_diff($studentIds, array_keys($classMap));
+        if (!empty($missing) && $db->tableExists('students') && $db->tableExists('classes')) {
+            $rows = $db->table('students st')
+                ->select('st.id as student_id, c.name as class_name')
+                ->join('classes c', 'c.id = st.class_id', 'inner')
+                ->whereIn('st.id', $missing)
+                ->get()->getResultArray();
+            foreach ($rows as $r) {
+                $sid = (int)$r['student_id'];
+                if (!isset($classMap[$sid])) {
+                    $classMap[$sid] = $r['class_name'];
+                }
+            }
+        }
+
+        return $classMap;
+    }
+}
