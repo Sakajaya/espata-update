@@ -1,0 +1,3478 @@
+<?php
+
+namespace App\Controllers\Admin;
+
+use App\Controllers\BaseController;
+use App\Models\KokurikulerDocumentModel;
+use App\Models\AcademicYearModel;
+use App\Models\SubjectModel;
+use App\Models\AlurTujuanPembelajaranModel;
+use App\Models\TujuanPembelajaranModel;
+use App\Services\AiContextBuilder;
+
+class Kokurikuler extends BaseController
+{
+    protected $documentModel;
+    protected $yearModel;
+    protected $subjectModel;
+    protected $atpModel;
+    protected $tpModel;
+    protected $pelaksanaanModel;
+    protected $rubrikModel;
+    protected $penilaianModel;
+    protected $aiContextBuilder;
+
+    public function __construct()
+    {
+        $this->documentModel = new KokurikulerDocumentModel();
+        $this->yearModel = new AcademicYearModel();
+        $this->subjectModel = new SubjectModel();
+        $this->atpModel = new AlurTujuanPembelajaranModel();
+        $this->tpModel = new TujuanPembelajaranModel();
+        $this->pelaksanaanModel = new \App\Models\KokurikulerPelaksanaanModel();
+        $this->rubrikModel = new \App\Models\KokurikulerRubrikModel();
+        $this->penilaianModel = new \App\Models\KokurikulerPenilaianModel();
+    }
+
+    /**
+     * Helper: Get jenis kokurikuler with backward compatibility
+     */
+    private function getJenisKokurikuler($document)
+    {
+        return $document['jenis_kokurikuler'] ?? $document['bentuk_kegiatan'] ?? '';
+    }
+
+    /**
+     * Index - Daftar Dokumen Rencana Kokurikuler
+     */
+    public function index()
+    {
+        $user = session()->get('user');
+        $roleId = $user['role_id'] ?? 0;
+        $userId = $user['id'] ?? 0;
+
+        // Admin (1), Kepsek (2), dan Guru Kelas/Wali Kelas (3) bisa akses
+        if (!in_array($roleId, [1, 2, 3])) {
+            return redirect()->back()->with('error', 'Anda tidak memiliki akses ke modul ini.');
+        }
+
+        $documents = $this->documentModel->getDocumentsWithCreator($userId, $roleId);
+
+        return view('admin/kokurikuler/index', [
+            'title' => 'Dokumen Rencana Kokurikuler',
+            'documents' => $documents,
+            'isReadOnly' => ($roleId == 2), // Kepsek read-only
+        ]);
+    }
+
+    /**
+     * Create - Form Tambah Dokumen Rencana
+     */
+    public function create()
+    {
+        $user = session()->get('user');
+        $roleId = $user['role_id'] ?? 0;
+
+        // Kepsek tidak bisa create
+        if (!in_array($roleId, [1, 3])) {
+            return redirect()->back()->with('error', 'Anda tidak memiliki akses.');
+        }
+
+        // Get active year
+        $activeYear = $this->yearModel->getActiveYear();
+        
+        // Get school level untuk menentukan fase
+        $db = \Config\Database::connect();
+        $school = $db->table('school_profile')->select('level')->get()->getRow();
+        $schoolLevel = $school->level ?? 1;
+
+        // Get subjects untuk lintas disiplin
+        if ($roleId == 1) {
+            // Admin: akses semua mata pelajaran
+            $subjects = $this->subjectModel->orderBy('name', 'ASC')->findAll();
+        } else {
+            // Guru Kelas (role_id = 3): hanya mata pelajaran di kelas yang ia walikan
+            $teacherId = $user['related_id'] ?? 0;
+            
+            // Get kelas yang diwalikan
+            $waliClass = $db->table('classes')
+                ->where('teacher_id', $teacherId)
+                ->get()
+                ->getRow();
+            
+            if (!$waliClass) {
+                return redirect()->back()->with('error', 'Anda belum ditugaskan sebagai wali kelas.');
+            }
+            
+            // Get semua mata pelajaran yang diajarkan di kelas tersebut
+            $subjectIds = $db->table('teaching_assignments')
+                ->select('subject_id')
+                ->distinct()
+                ->where('class_id', $waliClass->id)
+                ->where('academic_year_id', $activeYear['id'])
+                ->get()
+                ->getResultArray();
+            
+            $subjectIdList = array_column($subjectIds, 'subject_id');
+            
+            if (empty($subjectIdList)) {
+                return redirect()->back()->with('error', 'Tidak ada mata pelajaran yang diajarkan di kelas Anda.');
+            }
+            
+            // Get subject details
+            $subjects = $this->subjectModel
+                ->whereIn('id', $subjectIdList)
+                ->orderBy('name', 'ASC')
+                ->findAll();
+        }
+
+        // Load Sub Dimensi data
+        $subDimensiConfig = new \Config\SubDimensiProfilLulusan();
+        $subDimensiData = $subDimensiConfig->getSubDimensi();
+
+        return view('admin/kokurikuler/create', [
+            'title' => 'Buat Dokumen Rencana Kokurikuler',
+            'activeYear' => $activeYear,
+            'schoolLevel' => $schoolLevel,
+            'subjects' => $subjects,
+            'subDimensiData' => $subDimensiData,
+        ]);
+    }
+
+    /**
+     * Store - Simpan Dokumen Rencana (Step 1: Manual Input)
+     */
+    public function store()
+    {
+        if (!$this->request->isAJAX()) {
+            return redirect()->back()->with('error', 'Invalid request');
+        }
+
+        $user = session()->get('user');
+        $userId = $user['id'] ?? 0;
+
+        // Validation
+        $rules = [
+            'semester' => 'required|in_list[1,2]',
+            'fase' => 'required',
+            'level_kelas' => 'required',
+            'jumlah_pertemuan' => 'required|integer|greater_than[0]',
+            'dimensi_profil' => 'required',
+            'tema' => 'required|min_length[3]',
+            'jenis_kokurikuler' => 'required|in_list[lintas_disiplin,7kaih,lainnya]',
+            'bentuk_kegiatan_konkret' => 'required|min_length[10]',
+        ];
+
+        if (!$this->validate($rules)) {
+            return $this->response->setJSON([
+                'success' => false,
+                'message' => 'Validasi gagal',
+                'errors' => $this->validator->getErrors()
+            ]);
+        }
+
+        // Get active year
+        $activeYear = $this->yearModel->getActiveYear();
+        if (!$activeYear) {
+            return $this->response->setJSON([
+                'success' => false,
+                'message' => 'Tidak ada tahun ajaran aktif'
+            ]);
+        }
+
+        $semester = $this->request->getPost('semester');
+        $levelKelas = $this->request->getPost('level_kelas');
+        
+        // Cek apakah sudah ada rencana untuk semester dan level ini
+        $existingDoc = $this->documentModel
+            ->where('year_id', $activeYear['id'])
+            ->where('semester', $semester)
+            ->where('level_kelas', $levelKelas)
+            ->first();
+        
+        if ($existingDoc) {
+            return $this->response->setJSON([
+                'success' => false,
+                'message' => 'Sudah ada rencana kokurikuler untuk semester ' . $semester . ' di level kelas ' . $levelKelas . ' pada tahun ajaran ini.'
+            ]);
+        }
+
+        // Tentukan apakah ini template (dibuat oleh admin)
+        $isTemplate = ($user['role_id'] == 1) ? 1 : 0;
+
+        // Auto-assign class_id untuk wali kelas (role_id = 3)
+        $classId = null;
+        if ($user['role_id'] == 3) {
+            $teacherId = $user['related_id'] ?? 0;
+            $db = \Config\Database::connect();
+            
+            // Get kelas yang diwalikan
+            $waliClass = $db->table('classes')
+                ->where('teacher_id', $teacherId)
+                ->get()
+                ->getRow();
+            
+            if ($waliClass) {
+                $classId = $waliClass->id;
+            }
+        }
+
+        // Prepare data
+        $data = [
+            'year_id' => $activeYear['id'],
+            'semester' => $semester,
+            'fase' => $this->request->getPost('fase'),
+            'level_kelas' => $levelKelas,
+            'class_id' => $classId,
+            'jumlah_pertemuan' => $this->request->getPost('jumlah_pertemuan'),
+            'dimensi_profil' => json_encode($this->request->getPost('dimensi_profil')),
+            'tema' => $this->request->getPost('tema'),
+            'jenis_kokurikuler' => $this->request->getPost('jenis_kokurikuler'),
+            'bentuk_kegiatan_konkret' => $this->request->getPost('bentuk_kegiatan_konkret'),
+            'kegiatan_detail' => $this->prepareKegiatanDetail(),
+            'kemitraan' => json_encode($this->request->getPost('kemitraan') ?? []),
+            'teknologi_digital' => json_encode($this->request->getPost('teknologi_digital') ?? []),
+            'status' => 'draft',
+            'is_template' => $isTemplate,
+            'created_by' => $userId,
+        ];
+
+        try {
+            $id = $this->documentModel->insert($data);
+
+            return $this->response->setJSON([
+                'success' => true,
+                'message' => 'Data berhasil disimpan. Silakan generate konten dengan AI.',
+                'document_id' => $id
+            ]);
+        } catch (\Exception $e) {
+            log_message('error', 'Kokurikuler store error: ' . $e->getMessage());
+            return $this->response->setJSON([
+                'success' => false,
+                'message' => 'Gagal menyimpan data: ' . $e->getMessage()
+            ]);
+        }
+    }
+
+    /**
+     * Prepare kegiatan detail based on jenis_kokurikuler
+     */
+    private function prepareKegiatanDetail()
+    {
+        $jenisKokurikuler = $this->request->getPost('jenis_kokurikuler');
+
+        if ($jenisKokurikuler === 'lintas_disiplin') {
+            $subjects = $this->request->getPost('lintas_subjects'); // array of subject_id
+            
+            // Get all POST data to find lintas_tujuan_X[], lintas_dimensi_X, and lintas_subdimensi_X fields
+            $postData = $this->request->getPost();
+            $items = [];
+            
+            // Log all POST data for debugging
+            log_message('info', 'Kokurikuler POST Data: ' . json_encode($postData));
+            log_message('info', 'Kokurikuler Subjects array: ' . json_encode($subjects));
+            
+            // Build mapping of subject index to subject_id
+            $subjectMapping = [];
+            if (is_array($subjects)) {
+                foreach ($subjects as $idx => $subjectId) {
+                    $subjectMapping[$idx] = $subjectId;
+                    log_message('info', "Subject mapping: index $idx => subject_id $subjectId");
+                }
+            }
+            
+            // Extract data for each subject index
+            foreach ($postData as $key => $value) {
+                // Match lintas_tujuan_X[]
+                if (preg_match('/^lintas_tujuan_(\d+)$/', $key, $matches)) {
+                    $index = (int)$matches[1];
+                    $tpIds = $value; // array of TP IDs
+                    $dimensi = $postData['lintas_dimensi_' . $index] ?? '';
+                    $subDimensi = $postData['lintas_subdimensi_' . $index] ?? '';
+                    
+                    // Find subject_id by matching index
+                    $subjectId = null;
+                    
+                    // Try to find subject by checking if lintas_subjects array has this index
+                    $subjectIndex = 0;
+                    foreach ($postData as $k => $v) {
+                        if (preg_match('/^lintas_tujuan_(\d+)$/', $k, $m)) {
+                            if ((int)$m[1] == $index) {
+                                // Found the matching index, use the corresponding subject
+                                if (isset($subjects[$subjectIndex])) {
+                                    $subjectId = $subjects[$subjectIndex];
+                                }
+                                break;
+                            }
+                            $subjectIndex++;
+                        }
+                    }
+                    
+                    log_message('info', "Kokurikuler Lintas Index $index: subject=$subjectId, TPs=" . json_encode($tpIds) . ", dimensi=$dimensi, subdimensi=$subDimensi");
+                    
+                    if (!empty($tpIds) && !empty($dimensi) && !empty($subjectId)) {
+                        // Create one item per TP
+                        foreach ($tpIds as $tpId) {
+                            $items[] = [
+                                'subject_id' => $subjectId,
+                                'tp_id' => $tpId,
+                                'dimensi_profil' => $dimensi,
+                                'sub_dimensi' => $subDimensi,
+                            ];
+                        }
+                    } else {
+                        log_message('warning', "Kokurikuler Lintas Index $index: Missing data - subject=$subjectId, TPs=" . json_encode($tpIds) . ", dimensi=$dimensi");
+                    }
+                }
+            }
+            
+            $result = [
+                'subjects' => array_unique(array_column($items, 'subject_id')),
+                'items' => $items
+            ];
+            
+            log_message('info', 'Kokurikuler kegiatan_detail (lintas): ' . json_encode($result));
+            log_message('info', 'Kokurikuler Total items: ' . count($items));
+            
+            return json_encode($result);
+            
+        } elseif ($jenisKokurikuler === '7kaih') {
+            $postData = $this->request->getPost();
+            $items = [];
+            
+            // Extract data for each KAIH index
+            foreach ($postData as $key => $value) {
+                // Match kaih_items_X
+                if (preg_match('/^kaih_items_(\d+)$/', $key, $matches)) {
+                    $index = (int)$matches[1];
+                    $kaihItem = $value; // kebiasaan name
+                    $dimensi = $postData['kaih_dimensi_' . $index] ?? '';
+                    $subDimensi = $postData['kaih_subdimensi_' . $index] ?? '';
+                    
+                    if (!empty($kaihItem) && !empty($dimensi)) {
+                        $items[] = [
+                            'kaih' => $kaihItem,
+                            'dimensi_profil' => $dimensi,
+                            'sub_dimensi' => $subDimensi,
+                        ];
+                    }
+                    
+                    log_message('info', "Kokurikuler KAIH Index $index: kaih=$kaihItem, dimensi=$dimensi, subdimensi=$subDimensi");
+                }
+            }
+            
+            $result = ['items' => $items];
+            
+            log_message('info', 'Kokurikuler kegiatan_detail (7kaih): ' . json_encode($result));
+            
+            return json_encode($result);
+            
+        } else {
+            $postData = $this->request->getPost();
+            $items = [];
+            
+            foreach ($postData as $key => $value) {
+                // Match lainnya_dimensi_X
+                if (preg_match('/^lainnya_dimensi_(\d+)$/', $key, $matches)) {
+                    $index = (int)$matches[1];
+                    $dimensi = $value;
+                    $subDimensi = $postData['lainnya_subdimensi_' . $index] ?? '';
+                    
+                    if (!empty($dimensi) && !empty($subDimensi)) {
+                        $items[] = [
+                            'dimensi_profil' => $dimensi,
+                            'sub_dimensi' => $subDimensi,
+                        ];
+                    }
+                }
+            }
+            
+            $result = [
+                'text' => $this->request->getPost('lainnya_text'),
+                'items' => $items
+            ];
+            
+            return json_encode($result);
+        }
+    }
+
+    /**
+     * Helper: Get AiContextBuilder instance
+     */
+    protected function getAiContextBuilder(): AiContextBuilder
+    {
+        return $this->aiContextBuilder ??= new AiContextBuilder();
+    }
+
+    /**
+     * Helper untuk injeksi AiContextBuilder pada pengujian
+     */
+    public function setAiContextBuilder(AiContextBuilder $builder): self
+    {
+        $this->aiContextBuilder = $builder;
+        return $this;
+    }
+
+    /**
+     * Generate AI Content
+     */
+    public function generateAI($id)
+    {
+        if (!$this->request->isAJAX()) {
+            return redirect()->back();
+        }
+
+        $document = $this->documentModel->find($id);
+        if (!$document) {
+            return $this->response->setJSON([
+                'success' => false,
+                'message' => 'Dokumen tidak ditemukan'
+            ]);
+        }
+
+        // Check ownership
+        $user = session()->get('user');
+        if ($user['role_id'] != 1 && $document['created_by'] != $user['id']) {
+            return $this->response->setJSON([
+                'success' => false,
+                'message' => 'Anda tidak memiliki akses'
+            ]);
+        }
+
+        try {
+            $contextBuilder = $this->getAiContextBuilder();
+
+            // Kondisi 3: Cek apakah query sarana/fasilitas mengalami kesalahan teknis (QUERY_ERROR)
+            $facilityCheck = $contextBuilder->getConfirmedFacilities();
+            if (isset($facilityCheck['status']) && $facilityCheck['status'] === 'QUERY_ERROR') {
+                log_message('error', 'Kokurikuler generateAI: QUERY_ERROR saat membaca fasilitas sekolah: ' . ($facilityCheck['error'] ?? ''));
+                return $this->response->setJSON([
+                    'success' => false,
+                    'message' => 'Gagal menyiapkan konteks AI: Terjadi kesalahan kueri database pada fasilitas sekolah.'
+                ]);
+            }
+
+            // Kondisi 2: Validasi dokumen dan susun konteks faktual via AiContextBuilder
+            $contextResult = $contextBuilder->buildKokurikulerContext($document);
+            if (!$contextResult['success']) {
+                $errorMsg = $contextResult['message'] ?? 'Data dokumen tidak memenuhi syarat validasi konteks AI.';
+                log_message('error', 'Kokurikuler generateAI: Validasi konteks gagal: ' . $errorMsg . ' | Doc ID: ' . $id);
+                return $this->response->setJSON([
+                    'success' => false,
+                    'message' => 'Gagal memproses dokumen: ' . $errorMsg
+                ]);
+            }
+
+            // Susun prompt berdasarkan konteks faktual terverifikasi
+            $prompt = $this->buildAIPromptFromContext($contextResult['data']);
+
+            // Call AI API (sama seperti modul ajar)
+            $aiResponse = $this->callAIAPI($prompt);
+
+            if ($aiResponse['success']) {
+                // Update document dengan hasil AI
+                $this->documentModel->update($id, [
+                    'tujuan_pembelajaran' => $aiResponse['tujuan_pembelajaran'],
+                    'praktik_pedagogis' => $aiResponse['praktik_pedagogis'],
+                    'lingkungan_belajar' => $aiResponse['lingkungan_belajar'],
+                    'kegiatan_kokurikuler' => $aiResponse['kegiatan_kokurikuler'],
+                    'status' => 'completed'
+                ]);
+
+                return $this->response->setJSON([
+                    'success' => true,
+                    'message' => 'Konten berhasil di-generate',
+                    'data' => $aiResponse
+                ]);
+            } else {
+                return $this->response->setJSON([
+                    'success' => false,
+                    'message' => 'Gagal generate AI: ' . $aiResponse['message']
+                ]);
+            }
+        } catch (\Exception $e) {
+            log_message('error', 'AI Generate error: ' . $e->getMessage());
+            return $this->response->setJSON([
+                'success' => false,
+                'message' => 'Terjadi kesalahan: ' . $e->getMessage()
+            ]);
+        }
+    }
+
+    /**
+     * Build AI Prompt
+     *
+     * @param array $document Data dokumen mentah atau payload konteks terstruktur
+     * @return string
+     * @throws \RuntimeException Jika penyusunan konteks gagal
+     */
+    protected function buildAIPrompt($document)
+    {
+        // Jika parameter sudah merupakan payload konteks terstruktur dari AiContextBuilder
+        if (isset($document['sekolah']) && isset($document['dokumen']) && isset($document['panduan_anti_halusinasi'])) {
+            return $this->buildAIPromptFromContext($document);
+        }
+
+        $contextBuilder = $this->getAiContextBuilder();
+
+        // Validasi kegagalan teknis query fasilitas (Kondisi 3)
+        $facilityCheck = $contextBuilder->getConfirmedFacilities();
+        if (isset($facilityCheck['status']) && $facilityCheck['status'] === 'QUERY_ERROR') {
+            throw new \RuntimeException('Terjadi kesalahan kueri database pada data fasilitas sekolah.');
+        }
+
+        // Bangun konteks melalui service (Kondisi 1 & 2)
+        $contextResult = $contextBuilder->buildKokurikulerContext($document);
+        if (!$contextResult['success']) {
+            throw new \RuntimeException($contextResult['message'] ?? 'Gagal membangun konteks dokumen Kokurikuler.');
+        }
+
+        return $this->buildAIPromptFromContext($contextResult['data']);
+    }
+
+    /**
+     * Menyusun teks prompt AI Kokurikuler dari konteks faktual terstruktur
+     *
+     * @param array $context Konteks dari AiContextBuilder::buildKokurikulerContext()['data']
+     * @return string
+     */
+    protected function buildAIPromptFromContext(array $context): string
+    {
+        $sekolah = $context['sekolah'] ?? [];
+        $dokumen = $context['dokumen'] ?? [];
+        $profilLulusan = $context['profil_lulusan'] ?? [];
+        $sumberDaya = $context['sumber_daya'] ?? [];
+        $detailKegiatan = $context['detail_kegiatan'] ?? [];
+        $antiHalusinasi = $context['panduan_anti_halusinasi'] ?? [];
+
+        $schoolName = $sekolah['nama'] ?? 'Satuan Pendidikan';
+        $jenjang = $sekolah['jenjang'] ?? 'Fase Kurikulum';
+        $schoolCity = $sekolah['wilayah'] ?? '';
+        $fase = $dokumen['fase'] ?? '-';
+        $levelKelas = $dokumen['level_kelas'] ?? '-';
+        $jumlahPertemuan = max(1, (int)($dokumen['jumlah_pertemuan'] ?? 1));
+        $tema = $dokumen['tema'] ?? '-';
+        $jenisKokurikuler = $dokumen['jenis_kokurikuler'] ?? 'lainnya';
+        $bentukKegiatanKonkret = trim((string)($dokumen['bentuk_kegiatan_konkret'] ?? ''));
+
+        // Dimensi profil lulusan & subdimensi resmi
+        $dimensiList = $profilLulusan['dimensi_list'] ?? [];
+        $dimensiText = !empty($dimensiList) ? implode(', ', $dimensiList) : '-';
+        $subDimSnippets = [];
+        if (!empty($profilLulusan['dimensi_details']) && is_array($profilLulusan['dimensi_details'])) {
+            foreach ($profilLulusan['dimensi_details'] as $dimDetail) {
+                if (!empty($dimDetail['sub_dimensi']) && is_array($dimDetail['sub_dimensi'])) {
+                    $focusSubs = array_slice($dimDetail['sub_dimensi'], 0, 3);
+                    $subDimSnippets[] = $dimDetail['dimensi'] . ' (Fokus: ' . implode('; ', $focusSubs) . ')';
+                }
+            }
+        }
+        if (!empty($subDimSnippets)) {
+            $dimensiText .= "\n  - " . implode("\n  - ", $subDimSnippets);
+        }
+
+        // Kemitraan & Teknologi
+        $kemitraanText = $sumberDaya['kemitraan_text'] ?? 'Internal warga sekolah';
+        $teknologiText = $sumberDaya['teknologi_text'] ?? 'Media fisik konvensional';
+
+        // Konteks Detail Kegiatan
+        $kegiatanDetailText = $detailKegiatan['summary'] ?? '-';
+        if (!empty($detailKegiatan['tp_sasaran']) && is_array($detailKegiatan['tp_sasaran'])) {
+            $kegiatanDetailText .= "\nSasaran Capaian Pembelajaran terkait:\n- " . implode("\n- ", $detailKegiatan['tp_sasaran']);
+        }
+
+        // Fasilitas Sekolah Faktual
+        $fasilitasInfo = !empty($sekolah['has_fasilitas']) && !empty($sekolah['fasilitas'])
+            ? implode(', ', $sekolah['fasilitas'])
+            : 'Fasilitas ruang kelas standar dan area lingkungan sekolah (tidak tercatat fasilitas khusus tambahan)';
+
+        // Susun prompt
+        $prompt = "Anda adalah Perancang Pembelajaran Kokurikuler dan Projek Penguatan Profil Pelajar Kurikulum Merdeka yang berpengalaman, realistis, dan berorientasi pada aksi nyata peserta didik di lapangan.\n\n";
+        $prompt .= "INFORMASI DASAR KEGIATAN:\n";
+        $prompt .= "- Satuan Pendidikan: {$schoolName} ({$jenjang})" . (!empty($schoolCity) ? " di {$schoolCity}" : "") . "\n";
+        $prompt .= "- Fase: {$fase}\n";
+        $prompt .= "- Level Kelas: {$levelKelas}\n";
+        $prompt .= "- Jumlah Pertemuan: {$jumlahPertemuan} pertemuan\n";
+        $prompt .= "- Dimensi Profil Lulusan: {$dimensiText}\n";
+        $prompt .= "- Tema: {$tema}\n";
+        $prompt .= "- Jenis Kokurikuler: {$jenisKokurikuler}\n";
+        if (!empty($bentukKegiatanKonkret)) {
+            $prompt .= "- Bentuk Kegiatan Konkret: {$bentukKegiatanKonkret}\n";
+        }
+        $prompt .= "- Sarana Sekolah Terverifikasi: {$fasilitasInfo}\n";
+        $prompt .= "- Mitra yang Terlibat: {$kemitraanText}\n";
+        $prompt .= "- Dukungan Media/Teknologi: {$teknologiText}\n";
+        $prompt .= "- Konteks/Detail Kegiatan:\n{$kegiatanDetailText}\n\n";
+
+        $prompt .= "PEDOMAN KETERLAKSANAAN & REALISME LAPANGAN (WAJIB DIPATUHI):\n";
+        $prompt .= "1. KEGIATAN OPERASIONAL & REALISTIS: Setiap pertemuan harus menjabarkan tindakan konkret yang dilakukan siswa, alat/bahan yang dipakai, serta bukti artefak/karya yang dihasilkan.\n";
+        $prompt .= "2. KEPATUHAN SARANA FISIK: " . ($antiHalusinasi['sarana_sekolah'] ?? 'Gunakan sarana yang nyata di sekolah.') . "\n";
+        $prompt .= "3. KEPATUHAN TEKNOLOGI: " . ($antiHalusinasi['teknologi_strict'] ?? 'Gunakan media yang terdaftar.') . "\n";
+        $prompt .= "4. KEPATUHAN KEMITRAAN: " . ($antiHalusinasi['kemitraan_strict'] ?? 'Libatkan mitra yang terdaftar.') . "\n";
+        $prompt .= "5. ALUR PROJEK BERTAHAP: Susun {$jumlahPertemuan} pertemuan dengan alur logis: tahap pengenalan/orientasi masalah -> tahap kontekstualisasi/observasi -> tahap aksi nyata/pembuatan karya -> tahap pameran/refleksi evaluasi.\n";
+        $prompt .= "6. ALTERNATIF KENDALA: Sertakan catatan penyesuaian sederhana jika terjadi kendala sarana, cuaca, atau bahan.\n\n";
+
+        $prompt .= "INSTRUKSI FORMAT RESPON:\n";
+        $prompt .= "Hasilkan HANYA string JSON yang valid (tanpa teks tambahan sebelum/sesudah, tanpa code block markdown ```json).\n";
+        $prompt .= "Struktur JSON WAJIB persis seperti berikut:\n";
+        $prompt .= "{\n";
+        if (!empty($bentukKegiatanKonkret)) {
+            $prompt .= '  "tujuan_pembelajaran": "Tujuan pembelajaran yang menggabungkan kompetensi dari dimensi profil dengan konten tema. WAJIB diakhiri dengan kalimat: melalui kegiatan ' . $bentukKegiatanKonkret . '",'."\n";
+        } else {
+            $prompt .= '  "tujuan_pembelajaran": "Tujuan pembelajaran yang menggabungkan kompetensi dari dimensi profil dengan konten tema",'."\n";
+        }
+        $prompt .= '  "praktik_pedagogis": "Deskripsi praktik pedagogis kolaboratif, kontekstual, dan berpusat pada keterlibatan aktif siswa",'."\n";
+        $prompt .= '  "lingkungan_belajar": "Deskripsi lingkungan belajar (dalam/luar kelas, lingkungan sekolah) yang aman, inklusif, dan memanfaatkan sarana yang ada",'."\n";
+        $prompt .= '  "kegiatan_kokurikuler": ['."\n";
+
+        for ($i = 1; $i <= $jumlahPertemuan; $i++) {
+            $prompt .= '    {"pertemuan": '.$i.', "kegiatan": "Judul kegiatan pertemuan '.$i.'", "deskripsi": "Deskripsi terstruktur mencakup: (1) Tindakan konkret siswa, (2) Alat/bahan yang digunakan, (3) Target hasil/karya pertemuan ini, dan (4) Alternatif jika ada kendala."}';
+            if ($i < $jumlahPertemuan) {
+                $prompt .= ',';
+            }
+            $prompt .= "\n";
+        }
+
+        $prompt .= "  ]\n";
+        $prompt .= "}\n";
+
+        return $prompt;
+    }
+
+    /**
+     * Call AI API (sama seperti modul ajar)
+     */
+    private function callAIAPI($prompt)
+    {
+        $user = session()->get('user');
+        
+        // Get API Key and Provider
+        if ($user['role_id'] == 3) {
+            // Guru
+            $teacherModel = new \App\Models\TeacherModel();
+            $teacher = $teacherModel->find($user['related_id']);
+            $apiKey = $teacher['gemini_api_key'] ?? '';
+            $aiProvider = $teacher['ai_provider'] ?? 'gemini';
+        } else {
+            // Admin
+            $db = \Config\Database::connect();
+            $userData = $db->table('users')->where('id', $user['id'])->get()->getRowArray();
+            $apiKey = $userData['gemini_api_key'] ?? '';
+            $aiProvider = $userData['ai_provider'] ?? 'gemini';
+        }
+
+        if (empty($apiKey)) {
+            return [
+                'success' => false,
+                'message' => 'API Key belum diatur. Silakan atur API Key terlebih dahulu.'
+            ];
+        }
+
+        // Call AI API
+        $response = null;
+        $httpCode = 0;
+        $curlError = '';
+
+        if ($aiProvider === 'groq') {
+            $url = 'https://api.groq.com/openai/v1/chat/completions';
+            $headers = [
+                'Authorization: Bearer ' . $apiKey,
+                'Content-Type: application/json'
+            ];
+            // Model rekomendasi resmi Groq (Llama 3.3 70B sudah didekomisi per 16 Agustus 2026)
+            $groqModels = [
+                'openai/gpt-oss-120b',
+                'qwen/qwen3.6-27b',
+                'openai/gpt-oss-20b',
+                'qwen-2.5-32b',
+                'llama-3.1-8b-instant'
+            ];
+
+            foreach ($groqModels as $model) {
+                $payload = json_encode([
+                    "model" => $model,
+                    "messages" => [
+                        ["role" => "user", "content" => $prompt]
+                    ],
+                    "temperature" => 0.7,
+                    "max_tokens" => 8192,
+                    "reasoning_format" => "parsed"
+                ]);
+
+                $attempt = 0;
+                while ($attempt < 2) {
+                    $attempt++;
+                    $ch = curl_init($url);
+                    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+                    curl_setopt($ch, CURLOPT_POST, true);
+                    curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
+                    curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+                    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+                    curl_setopt($ch, CURLOPT_TIMEOUT, 120);
+                    $response = curl_exec($ch);
+                    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                    $curlError = curl_error($ch);
+                    curl_close($ch);
+
+                    if ($httpCode === 200) {
+                        break 2;
+                    }
+
+                    if (in_array($httpCode, [400, 404])) {
+                        break;
+                    }
+
+                    if ($httpCode === 429 || $httpCode === 503) {
+                        sleep(2);
+                    } else {
+                        break;
+                    }
+                }
+            }
+        } else {
+            // Gemini (dengan fallback model)
+            $geminiModels = ['gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-1.5-pro'];
+            $headers = ['Content-Type: application/json'];
+            $payload = json_encode([
+                "contents" => [
+                    ["parts" => [["text" => $prompt]]]
+                ],
+                "generationConfig" => [
+                    "maxOutputTokens" => 8192,
+                    "temperature" => 0.7
+                ]
+            ]);
+
+            foreach ($geminiModels as $gModel) {
+                $url = "https://generativelanguage.googleapis.com/v1beta/models/{$gModel}:generateContent?key=" . $apiKey;
+                $attempt = 0;
+                while ($attempt < 2) {
+                    $attempt++;
+                    $ch = curl_init($url);
+                    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+                    curl_setopt($ch, CURLOPT_POST, true);
+                    curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
+                    curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+                    curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+                    curl_setopt($ch, CURLOPT_TIMEOUT, 120);
+                    $response = curl_exec($ch);
+                    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                    $curlError = curl_error($ch);
+                    curl_close($ch);
+
+                    if ($httpCode === 200) {
+                        break 2;
+                    }
+
+                    if (in_array($httpCode, [400, 404])) {
+                        break;
+                    }
+
+                    if ($httpCode === 429 || $httpCode === 503) {
+                        sleep(2);
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if ($httpCode != 200) {
+            log_message('error', "Kokurikuler AI ($aiProvider) Failed. HTTP: $httpCode. Curl Error: $curlError. Response: $response");
+            $errorMsg = "Gagal memanggil API $aiProvider (HTTP $httpCode). ";
+            if ($response) {
+                $errRes = json_decode($response, true);
+                if ($aiProvider === 'groq' && isset($errRes['error']['message'])) {
+                    $errorMsg .= "Error API: " . $errRes['error']['message'];
+                } elseif (isset($errRes['error']['message'])) {
+                    $errorMsg .= "Error API: " . $errRes['error']['message'];
+                } else {
+                    $errorMsg .= "Pastikan API Key valid atau batas kuota.";
+                }
+            } elseif ($curlError) {
+                $errorMsg .= "cURL: $curlError";
+            }
+            if ($httpCode == 503) {
+                $errorMsg .= " (Server $aiProvider sedang padat/antre. Coba lagi beberapa saat lagi atau gunakan provider Groq).";
+            }
+            return [
+                'success' => false,
+                'message' => $errorMsg
+            ];
+        }
+
+        $resData = json_decode($response, true);
+        if ($aiProvider === 'groq') {
+            $content = $resData['choices'][0]['message']['content'] ?? '';
+            $content = preg_replace('/<think>[\s\S]*?<\/think>/i', '', $content);
+        } else {
+            $content = '';
+            if (!empty($resData['candidates'][0]['content']['parts'])) {
+                foreach ($resData['candidates'][0]['content']['parts'] as $part) {
+                    if (!empty($part['text'])) {
+                        $content .= $part['text'];
+                    }
+                }
+            }
+        }
+
+        // Log raw response for debugging
+        log_message('info', "Kokurikuler AI Raw Response: " . substr($content, 0, 500));
+
+        // Clean up response - remove markdown code blocks
+        $content = preg_replace('/```(?:json)?\s*/s', '', $content);
+        $content = preg_replace('/```\s*$/s', '', $content);
+        $content = trim($content);
+        
+        // Try to extract JSON if there's text before/after
+        if (preg_match('/\{[\s\S]*\}/s', $content, $matches)) {
+            $content = $matches[0];
+        }
+        
+        // Log cleaned content
+        log_message('info', "Kokurikuler AI Cleaned Content: " . substr($content, 0, 500));
+        
+        $aiData = json_decode($content, true);
+        
+        if (!$aiData || json_last_error() !== JSON_ERROR_NONE) {
+            log_message('error', "Kokurikuler AI JSON Parse Error: " . json_last_error_msg() . " | Content: " . substr($content, 0, 1000));
+            return [
+                'success' => false,
+                'message' => 'Gagal parsing response AI. Format tidak valid. Error: ' . json_last_error_msg()
+            ];
+        }
+
+        $rawKegiatan = $aiData['kegiatan_kokurikuler'] ?? [];
+        if (!is_array($rawKegiatan)) {
+            $rawKegiatan = [];
+        }
+        $normalizedKegiatan = [];
+        foreach ($rawKegiatan as $idx => $item) {
+            if (is_array($item)) {
+                $kegiatanText = trim((string)($item['kegiatan'] ?? ''));
+                $deskripsiText = trim((string)($item['deskripsi'] ?? ''));
+                // Item valid jika setidaknya nama kegiatan atau deskripsi terisi
+                if ($kegiatanText !== '' || $deskripsiText !== '') {
+                    $normalizedKegiatan[] = [
+                        'pertemuan' => (int)($item['pertemuan'] ?? ($idx + 1)),
+                        'kegiatan'  => $kegiatanText !== '' ? $kegiatanText : ('Kegiatan Pertemuan ' . ($idx + 1)),
+                        'deskripsi' => $deskripsiText
+                    ];
+                }
+            }
+        }
+
+        // Validasi: kegiatan_kokurikuler harus memiliki minimal 1 kegiatan yang valid
+        if (empty($normalizedKegiatan)) {
+            log_message('error', "Kokurikuler AI Response Error: kegiatan_kokurikuler kosong atau tidak memiliki kegiatan valid. Raw: " . substr($content, 0, 500));
+            return [
+                'success' => false,
+                'message' => 'AI tidak menghasilkan rincian kegiatan kokurikuler per pertemuan yang valid. Silakan coba generate ulang.'
+            ];
+        }
+
+        return [
+            'success' => true,
+            'tujuan_pembelajaran' => trim((string)($aiData['tujuan_pembelajaran'] ?? '')),
+            'praktik_pedagogis'   => trim((string)($aiData['praktik_pedagogis'] ?? '')),
+            'lingkungan_belajar'  => trim((string)($aiData['lingkungan_belajar'] ?? '')),
+            'kegiatan_kokurikuler' => json_encode($normalizedKegiatan, JSON_UNESCAPED_UNICODE)
+        ];
+    }
+
+    /**
+     * Get ATP by Subject (AJAX)
+     */
+    public function getATPBySubject($subjectId)
+    {
+        if (!$this->request->isAJAX()) {
+            return $this->response->setJSON(['success' => false]);
+        }
+
+        $user = session()->get('user');
+        $roleId = $user['role_id'] ?? 0;
+        
+        // Validasi akses untuk Guru Kelas
+        if ($roleId == 3) {
+            $teacherId = $user['related_id'] ?? 0;
+            $db = \Config\Database::connect();
+            
+            // Get active year
+            $activeYear = $this->yearModel->getActiveYear();
+            
+            // Get kelas yang diwalikan
+            $waliClass = $db->table('classes')
+                ->where('teacher_id', $teacherId)
+                ->get()
+                ->getRow();
+            
+            if (!$waliClass) {
+                return $this->response->setJSON([
+                    'success' => false,
+                    'message' => 'Anda belum ditugaskan sebagai wali kelas.'
+                ]);
+            }
+            
+            // Cek apakah subject_id ada di kelas yang diwalikan
+            $subjectExists = $db->table('teaching_assignments')
+                ->where('class_id', $waliClass->id)
+                ->where('subject_id', $subjectId)
+                ->where('academic_year_id', $activeYear['id'])
+                ->countAllResults();
+            
+            if ($subjectExists == 0) {
+                return $this->response->setJSON([
+                    'success' => false,
+                    'message' => 'Mata pelajaran ini tidak ada di kelas Anda.'
+                ]);
+            }
+        }
+
+        // Get Tujuan Pembelajaran (TP) for the subject
+        $tpList = $this->tpModel
+            ->where('subject_id', $subjectId)
+            ->orderBy('id', 'ASC')
+            ->findAll();
+
+        return $this->response->setJSON([
+            'success' => true,
+            'data' => $tpList
+        ]);
+    }
+
+    /**
+     * AI Consultant - Rekomendasi Perencanaan Kokurikuler (Langkah Awal)
+     * Menganalisis kondisi sekolah, jenjang, fase, semester, dan TP lintas mapel
+     */
+    public function recommendAI()
+    {
+        $user = session()->get('user');
+        $roleId = $user['role_id'] ?? 0;
+
+        if (!in_array($roleId, [1, 3])) {
+            return $this->response->setJSON([
+                'success' => false,
+                'message' => 'Anda tidak memiliki hak akses untuk konsultasi perencanaan kokurikuler.'
+            ]);
+        }
+
+        $fase = trim((string)($this->request->getVar('fase') ?? ''));
+        $semester = trim((string)($this->request->getVar('semester') ?? ''));
+        $focusKeyword = trim((string)($this->request->getVar('focus_keyword') ?? ''));
+        $levelKelasInput = $this->request->getVar('level_kelas');
+
+        $db = \Config\Database::connect();
+        $school = $db->table('school_profile')->select('name, level, address')->get()->getRow();
+        $schoolLevel = (int)($school->level ?? 2);
+        $schoolName = $school->name ?? 'Sekolah';
+
+        if (empty($fase)) {
+            $fase = ($schoolLevel == 1) ? 'A' : (($schoolLevel == 2) ? 'D' : 'E');
+        }
+        if (empty($semester)) {
+            $semester = '1';
+        }
+
+        // Tentukan level kelas default sesuai fase
+        $levelKelasMap = [
+            'A' => ['1', '2'],
+            'B' => ['3', '4'],
+            'C' => ['5', '6'],
+            'D' => ['7', '8', '9'],
+            'E' => ['10'],
+            'F' => ['11', '12']
+        ];
+        
+        // Pertimbangkan level kelas spesifik dari input filter jika ada
+        $targetClasses = [];
+        if (!empty($levelKelasInput)) {
+            if (is_array($levelKelasInput)) {
+                $targetClasses = array_values(array_filter($levelKelasInput));
+            } elseif (is_string($levelKelasInput)) {
+                $targetClasses = array_values(array_filter(array_map('trim', explode(',', $levelKelasInput))));
+            }
+        }
+        if (empty($targetClasses)) {
+            $targetClasses = $levelKelasMap[$fase] ?? ['7', '8'];
+        }
+
+        $activeYear = $this->yearModel->getActiveYear();
+        $activeYearId = $activeYear['id'] ?? 1;
+
+        // Ambil mata pelajaran yang relevan
+        if ($roleId == 1) {
+            $subjects = $this->subjectModel->orderBy('name', 'ASC')->findAll();
+        } else {
+            $teacherId = $user['related_id'] ?? 0;
+            $waliClass = $db->table('classes')->where('teacher_id', $teacherId)->get()->getRow();
+            if (!$waliClass) {
+                return $this->response->setJSON([
+                    'success' => false,
+                    'message' => 'Anda belum ditugaskan sebagai wali kelas.'
+                ]);
+            }
+
+            $subjectIds = $db->table('teaching_assignments')
+                ->select('subject_id')
+                ->distinct()
+                ->where('class_id', $waliClass->id)
+                ->where('academic_year_id', $activeYearId)
+                ->get()
+                ->getResultArray();
+
+            $subjectIdList = array_column($subjectIds, 'subject_id');
+            if (empty($subjectIdList)) {
+                return $this->response->setJSON([
+                    'success' => false,
+                    'message' => 'Tidak ada mata pelajaran yang diajarkan di kelas Anda.'
+                ]);
+            }
+
+            $subjects = $this->subjectModel->whereIn('id', $subjectIdList)->orderBy('name', 'ASC')->findAll();
+        }
+
+        // Ambil TP yang terdaftar dengan prioritas keselarasan Fase dan Level Kelas
+        $subjectTpMap = [];
+        $subjectIds = array_column($subjects, 'id');
+        if (!empty($subjectIds)) {
+            $escapedClasses = array_map(function($c) use ($db) { return $db->escape($c); }, $targetClasses);
+            $classesInClause = implode(',', $escapedClasses);
+
+            $allTps = $this->tpModel
+                ->whereIn('subject_id', $subjectIds)
+                ->orderBy("CASE WHEN fase = " . $db->escape($fase) . " THEN 0 ELSE 1 END", 'ASC')
+                ->orderBy(!empty($classesInClause) ? "CASE WHEN kelas IN ({$classesInClause}) THEN 0 ELSE 1 END" : "id", 'ASC')
+                ->orderBy('subject_id', 'ASC')
+                ->orderBy('id', 'ASC')
+                ->findAll();
+
+            foreach ($allTps as $tp) {
+                $sId = $tp['subject_id'];
+                if (!isset($subjectTpMap[$sId])) {
+                    $subjectTpMap[$sId] = [];
+                }
+                $subjectTpMap[$sId][] = $tp;
+            }
+        }
+
+        // Cek API Key pengguna (Guru atau Admin)
+        $apiKey = '';
+        $aiProvider = 'gemini';
+        if ($roleId == 3) {
+            $teacherModel = new \App\Models\TeacherModel();
+            $teacher = $teacherModel->find($user['related_id'] ?? 0);
+            $apiKey = $teacher['gemini_api_key'] ?? '';
+            $aiProvider = $teacher['ai_provider'] ?? 'gemini';
+        } else {
+            $userData = $db->table('users')->where('id', $user['id'] ?? 0)->get()->getRowArray();
+            $apiKey = $userData['gemini_api_key'] ?? '';
+            $aiProvider = $userData['ai_provider'] ?? 'gemini';
+        }
+
+        // 1. Fallback: Cari API Key milik Admin di tabel users
+        if (empty($apiKey)) {
+            $adminUser = $db->table('users')
+                ->where('gemini_api_key !=', '')
+                ->where('gemini_api_key IS NOT NULL')
+                ->orderBy('id', 'ASC')
+                ->get()
+                ->getRowArray();
+            if ($adminUser && !empty($adminUser['gemini_api_key'])) {
+                $apiKey = $adminUser['gemini_api_key'];
+                $aiProvider = $adminUser['ai_provider'] ?? 'groq';
+            }
+        }
+
+        // 2. Fallback: Cari API Key milik Guru manapun di tabel teachers
+        if (empty($apiKey)) {
+            $anyTeacher = $db->table('teachers')
+                ->where('gemini_api_key !=', '')
+                ->where('gemini_api_key IS NOT NULL')
+                ->orderBy('id', 'ASC')
+                ->get()
+                ->getRowArray();
+            if ($anyTeacher && !empty($anyTeacher['gemini_api_key'])) {
+                $apiKey = $anyTeacher['gemini_api_key'];
+                $aiProvider = $anyTeacher['ai_provider'] ?? 'groq';
+            }
+        }
+
+        // 3. Fallback: Cek environment variables (.env)
+        if (empty($apiKey)) {
+            $groqEnv = getenv('GROQ_API_KEY') ?: ($_ENV['GROQ_API_KEY'] ?? '');
+            if (!empty($groqEnv)) {
+                $apiKey = $groqEnv;
+                $aiProvider = 'groq';
+            }
+        }
+        if (empty($apiKey)) {
+            $geminiEnv = getenv('GEMINI_API_KEY') ?: ($_ENV['GEMINI_API_KEY'] ?? '');
+            if (!empty($geminiEnv)) {
+                $apiKey = $geminiEnv;
+                $aiProvider = 'gemini';
+            }
+        }
+
+        // 4. Normalisasi dan Auto-Deteksi Provider berdasarkan prefix key
+        $apiKey = trim((string)$apiKey);
+        if (!empty($apiKey)) {
+            if (str_starts_with($apiKey, 'gsk_')) {
+                $aiProvider = 'groq';
+            } elseif (str_starts_with($apiKey, 'AIzaSy')) {
+                $aiProvider = 'gemini';
+            }
+        }
+
+        $recommendations = [];
+        $source = 'curated';
+        $modelUsed = '';
+        $diagReason = '';
+        $diagTip = '';
+        $totalTpsCount = 0;
+        foreach ($subjectTpMap as $tpArray) {
+            $totalTpsCount += count($tpArray);
+        }
+
+        if (!empty($apiKey)) {
+            $aiResult = $this->callAIPlanningAPI($apiKey, $aiProvider, [
+                'school_name' => $schoolName,
+                'school_level' => $schoolLevel,
+                'fase' => $fase,
+                'semester' => $semester,
+                'focus_keyword' => $focusKeyword,
+                'subjects' => $subjects,
+                'subject_tp_map' => $subjectTpMap,
+                'target_classes' => $targetClasses
+            ]);
+
+            if ($aiResult['success'] && !empty($aiResult['packages'])) {
+                $recommendations = $aiResult['packages'];
+                $source = 'ai_' . $aiProvider;
+                $modelUsed = $aiResult['model'] ?? '';
+            } else {
+                $diagReason = $aiResult['message'] ?? 'Koneksi ke server AI tidak berhasil.';
+                $diagTip = 'Pastikan server hosting mengizinkan cURL outbound HTTPS (port 443) atau periksa kuota API Key.';
+            }
+        } else {
+            $diagReason = 'Kunci API (Groq/Gemini) belum ditemukan di database online maupun file .env.';
+            $diagTip = 'Silakan simpan API Key Anda di menu Administrasi Guru > Modul Ajar (Modal Pengaturan AI) atau tambahkan ke tabel users.';
+        }
+
+        // Jika API Key kosong atau panggilan AI gagal, gunakan curated matrix yang adaptif
+        if (empty($recommendations)) {
+            $recommendations = $this->getCuratedKokurikulerPackages($schoolLevel, $fase, $semester, $focusKeyword, $subjects, $subjectTpMap, $targetClasses);
+            $source = 'curated_matrix';
+        }
+
+        return $this->response->setJSON([
+            'success' => true,
+            'source' => $source,
+            'model_used' => $modelUsed,
+            'provider' => $aiProvider,
+            'school_name' => $schoolName,
+            'total_subjects_analyzed' => count($subjects),
+            'total_tps_analyzed' => $totalTpsCount,
+            'focus_keyword' => $focusKeyword,
+            'fase' => $fase,
+            'semester' => $semester,
+            'diag_reason' => $diagReason,
+            'diag_tip' => $diagTip,
+            'message' => ($source === 'curated_matrix')
+                ? 'Rekomendasi disusun berdasarkan kurasi standar Kurikulum Merdeka (Mode Fallback).'
+                : "Rekomendasi berhasil dianalisis secara real-time oleh AI ({$aiProvider}: {$modelUsed}) berdasarkan TP aktif.",
+            'packages' => $recommendations
+        ]);
+    }
+
+    /**
+     * Panggil AI untuk menghasilkan 2-3 paket rekomendasi kokurikuler
+     */
+    private function callAIPlanningAPI($apiKey, $aiProvider, $context)
+    {
+        $schoolName = $context['school_name'];
+        $fase = $context['fase'];
+        $semester = $context['semester'];
+        $focus = $context['focus_keyword'];
+        $subjects = $context['subjects'];
+        $subjectTpMap = $context['subject_tp_map'];
+        $targetClasses = $context['target_classes'];
+
+        $subjectListLines = [];
+        foreach ($subjects as $sb) {
+            $sId = $sb['id'];
+            $sName = $sb['name'];
+            $tps = $subjectTpMap[$sId] ?? [];
+            $tpItems = [];
+            foreach (array_slice($tps, 0, 4) as $tp) {
+                $tpDesc = addslashes(mb_substr($tp['deskripsi'], 0, 80));
+                $tpKelas = !empty($tp['kelas']) ? "Kelas {$tp['kelas']}" : 'Umum';
+                $tpFase = !empty($tp['fase']) ? "Fase {$tp['fase']}" : "Fase {$fase}";
+                $tpItems[] = "{id: {$tp['id']}, kode: \"{$tp['kode_tp']}\", level: \"{$tpKelas} ({$tpFase})\", teks: \"{$tpDesc}\"}";
+            }
+            $subjectListLines[] = "- Mapel ID {$sId} ({$sName}): [" . implode(', ', $tpItems) . "]";
+        }
+        $subjectsPayload = implode("\n", array_slice($subjectListLines, 0, 10));
+
+        // Panduan Tahap Perkembangan & Level Kognitif Kurikulum Merdeka
+        $faseGuidelines = [
+            'A' => 'Fase A (Kelas 1-2 SD): Kognitif konkret-sensori motorik. Belajar melalui bermain, pengamatan sederhana di lingkungan kelas/sekolah, pembiasaan karakter dasar, tanpa beban analisis teoritis.',
+            'B' => 'Fase B (Kelas 3-4 SD): Kognitif konkret terstruktur. Mampu observasi terarah, pengelompokan data visual, kerja tim sederhana, dan menghasilkan produk fisik/karya manual terstruktur.',
+            'C' => 'Fase C (Kelas 5-6 SD): Kognitif pra-formal logis. Mampu berpikir kausalitas/sebab-akibat, audit/pengukuran sederhana (pecahan, proporsi, persentase data), kampanye persuasif, dan karya nyata fungsional.',
+            'D' => 'Fase D (Kelas 7-9 SMP): Kognitif formal awal. Mampu berpikir kritis-abstrak, riset lingkungan sekolah, rekayasa teknologi tepat guna sederhana, dan proyek kewirausahaan mini terorganisir.',
+            'E' => 'Fase E (Kelas 10 SMA): Kognitif eksplorasi mandiri. Mampu riset literatur, metodologi ilmiah, identifikasi isu sosial-ekologis, dan inovasi gagasan multidisipliner.',
+            'F' => 'Fase F (Kelas 11-12 SMA): Kognitif pematangan & spesialisasi. Mampu rancang bangun prototipe terapan, analisis kritis sistemik, kewirausahaan mandiri, dan kepemimpinan aksi sosial nyata.'
+        ];
+        $developmentalGuideline = $faseGuidelines[$fase] ?? $faseGuidelines['D'];
+        $targetClassesText = implode(', ', $targetClasses);
+
+        $prompt = "Anda adalah Konsultan Ahli Kurikulum Merdeka & Koordinator Kokurikuler di {$schoolName}.\n"
+            . "Tugas Anda: Rancang 2 sampai 3 alternatif Paket Rencana Projek Kokurikuler Lintas Disiplin Ilmu yang inovatif, kontekstual, dan BENAR-BENAR MEMPERTIMBANGKAN LEVEL KOGNITIF MURID.\n\n"
+            . "KONTEKS TARGET:\n"
+            . "- Jenjang Satuan: Tingkat {$schoolName}\n"
+            . "- Fase: {$fase} | Level Kelas Sasaran: Kelas {$targetClassesText}\n"
+            . "- Karakteristik Perkembangan Kognitif: {$developmentalGuideline}\n"
+            . "- Semester: {$semester}\n"
+            . ($focus !== '' ? "- Fokus / Minat Topik Guru: {$focus}\n" : "- Fokus Topik: Sesuai isu kontekstual aktual sekolah & lingkungan sekitar\n")
+            . "- Daftar Mata Pelajaran & TP riil di database (perhatikan atribut level kelas & fase di tiap TP):\n{$subjectsPayload}\n\n"
+            . "DIMENSI PROFIL LULUSAN RESMI:\n"
+            . "Keimanan dan Ketakwaan Terhadap Tuhan YME, Kewargaan, Penalaran Kritis, Kreativitas, Kemandirian, Kolaborasi, Kesehatan, Komunikasi.\n\n"
+            . "PEDOMAN ANALISIS KESELARASAN LEVEL KOGNITIF & FASE:\n"
+            . "1. Analisis keterkaitan Tujuan Pembelajaran (TP) dari minimal 2 mata pelajaran yang tersedia di atas.\n"
+            . "2. PENTING: Bentuk kegiatan nyata dan keterpaduan TP yang dirancang HARUS SESUAI DENGAN TAHAP PERKEMBANGAN kognitif murid Kelas {$targetClassesText} (Fase {$fase}). Jangan terlalu rumit/abstrak jika jenjang dasar, dan jangan terlalu kekanak-kanakan jika jenjang menengah.\n"
+            . "3. Gunakan subject_id dan tp_ids riil dari daftar di atas.\n"
+            . "4. Pada atribut 'alasan_analisis', jelaskan secara eksplisit: Mengapa pemilihan TP lintas mapel ini selaras dengan kapasitas kognitif murid Kelas {$targetClassesText}.\n\n"
+            . "Berikan HANYA array JSON valid (tanpa markdown ```json ```, tanpa pengantar):\n"
+            . "[\n"
+            . "  {\n"
+            . "    \"id\": \"paket_1\",\n"
+            . "    \"judul_paket\": \"Judul Projek Menarik Sesuai Level Murid\",\n"
+            . "    \"tema\": \"Tema Kurikulum Merdeka (Gaya Hidup Berkelanjutan / Kewirausahaan / Rekayasa dan Teknologi / Kearifan Lokal / Bhinneka Tunggal Ika / Bangun Jiwa Raga / Suara Demokrasi)\",\n"
+            . "    \"dimensi_profil\": [\"Penalaran Kritis\", \"Kolaborasi\"],\n"
+            . "    \"level_kelas\": [\"" . implode('", "', $targetClasses) . "\"],\n"
+            . "    \"jumlah_pertemuan\": 16,\n"
+            . "    \"bentuk_kegiatan_konkret\": \"Rincian kegiatan nyata murid yang terukur sepanjang semester sesuai usianya\",\n"
+            . "    \"alasan_analisis\": \"Ulasan analitis pedagogis: Keterkaitan TP lintas mapel dan keselarasan level kognitif murid\",\n"
+            . "    \"lintas_disiplin\": [\n"
+            . "      {\n"
+            . "        \"subject_id\": (pilih ID mata pelajaran dari daftar),\n"
+            . "        \"subject_name\": \"Nama Mapel\",\n"
+            . "        \"tp_ids\": [(ID TP riil dari daftar di atas)],\n"
+            . "        \"dimensi\": \"Dimensi Profil terpilih\",\n"
+            . "        \"sub_dimensi\": \"Sub Dimensi yang relevan\"\n"
+            . "      }\n"
+            . "    ]\n"
+            . "  }\n"
+            . "]";
+
+        $content = '';
+        $usedModel = '';
+        $lastError = '';
+
+        if ($aiProvider === 'groq') {
+            $url = 'https://api.groq.com/openai/v1/chat/completions';
+            $headers = [
+                'Authorization: Bearer ' . $apiKey,
+                'Content-Type: application/json'
+            ];
+            $groqModels = [
+                'openai/gpt-oss-20b',
+                'qwen/qwen3.8-27b',
+                'openai/gpt-oss-120b'
+            ];
+
+            foreach ($groqModels as $gModel) {
+                $payload = json_encode([
+                    "model" => $gModel,
+                    "messages" => [["role" => "user", "content" => $prompt]],
+                    "temperature" => 0.5,
+                    "max_tokens" => 3500
+                ]);
+
+                $ch = curl_init($url);
+                curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+                curl_setopt($ch, CURLOPT_POST, true);
+                curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
+                curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+                curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+                curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 0);
+                if (defined('CURL_IPRESOLVE_V4')) {
+                    curl_setopt($ch, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4);
+                }
+                curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 15);
+                curl_setopt($ch, CURLOPT_TIMEOUT, 40);
+
+                $response = curl_exec($ch);
+                $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                $curlErr = curl_error($ch);
+                curl_close($ch);
+
+                if ($httpCode === 200) {
+                    $resData = json_decode($response, true);
+                    $content = $resData['choices'][0]['message']['content'] ?? '';
+                    if (!empty($content)) {
+                        $usedModel = $gModel;
+                        break;
+                    }
+                } else {
+                    $lastError = "HTTP {$httpCode} (" . ($curlErr ?: substr($response, 0, 150)) . ")";
+                }
+            }
+        } else {
+            $geminiModels = ['gemini-2.0-flash', 'gemini-1.5-flash', 'gemini-1.5-pro'];
+            $headers = ['Content-Type: application/json'];
+            $payload = json_encode([
+                "contents" => [["parts" => [["text" => $prompt]]]],
+                "generationConfig" => [
+                    "temperature" => 0.5,
+                    "maxOutputTokens" => 3500
+                ]
+            ]);
+
+            foreach ($geminiModels as $gModel) {
+                $url = "https://generativelanguage.googleapis.com/v1beta/models/{$gModel}:generateContent?key=" . $apiKey;
+                $ch = curl_init($url);
+                curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+                curl_setopt($ch, CURLOPT_POST, true);
+                curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
+                curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+                curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+                curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 0);
+                if (defined('CURL_IPRESOLVE_V4')) {
+                    curl_setopt($ch, CURLOPT_IPRESOLVE, CURL_IPRESOLVE_V4);
+                }
+                curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 15);
+                curl_setopt($ch, CURLOPT_TIMEOUT, 40);
+
+                $response = curl_exec($ch);
+                $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                $curlErr = curl_error($ch);
+                curl_close($ch);
+
+                if ($httpCode === 200) {
+                    $resData = json_decode($response, true);
+                    if (!empty($resData['candidates'][0]['content']['parts'])) {
+                        foreach ($resData['candidates'][0]['content']['parts'] as $part) {
+                            if (!empty($part['text'])) {
+                                $content .= $part['text'];
+                            }
+                        }
+                    }
+                    if (!empty($content)) {
+                        $usedModel = $gModel;
+                        break;
+                    }
+                } else {
+                    $lastError = "HTTP {$httpCode} (" . ($curlErr ?: substr($response, 0, 150)) . ")";
+                }
+            }
+        }
+
+        if (empty($content)) {
+            log_message('error', "Kokurikuler AI Planning Failed: {$lastError}");
+            return ['success' => false, 'message' => "AI Response gagal: " . ($lastError ?: 'Koneksi timeout')];
+        }
+
+        $content = preg_replace('/```(?:json)?\s*/i', '', $content);
+        $content = preg_replace('/```\s*$/', '', $content);
+        $content = trim($content);
+
+        if (preg_match('/\[[\s\S]*\]/', $content, $m)) {
+            $content = $m[0];
+        }
+
+        $packages = json_decode($content, true);
+        if (!is_array($packages) || empty($packages)) {
+            return ['success' => false, 'message' => 'Format JSON tidak valid'];
+        }
+
+        return [
+            'success' => true,
+            'packages' => $packages,
+            'model' => $usedModel,
+            'provider' => $aiProvider
+        ];
+    }
+
+    /**
+     * Paket Rekomendasi Kokurikuler Kurikulum Merdeka (Smart Heuristic Fallback)
+     */
+    private function getCuratedKokurikulerPackages($schoolLevel, $fase, $semester, $focusKeyword, $subjects, $subjectTpMap, $targetClasses)
+    {
+        // Helper untuk mencari mapel berdasarkan kata kunci nama
+        $findSubject = function($pattern) use ($subjects) {
+            foreach ($subjects as $s) {
+                if (preg_match($pattern, $s['name'])) {
+                    return $s;
+                }
+            }
+            return null;
+        };
+
+        // Pemetaan mapel relevan
+        $sIpa = $findSubject('/ipa|alam|biologi|fisika|sains/i');
+        $sMat = $findSubject('/matematika|math|hitung/i');
+        $sIndo = $findSubject('/indonesia|bahasa/i');
+        $sTik = $findSubject('/informatika|tik|komputer|digital/i');
+        $sIps = $findSubject('/ips|sosial|pancasila|pkn|pkn/i');
+        $sKarya = $findSubject('/prakarya|seni|budaya|kewirausahaan/i');
+
+        // Fallback jika mapel khusus tidak ditemukan
+        $availableList = array_values($subjects);
+        if (!$sIpa && isset($availableList[0])) $sIpa = $availableList[0];
+        if (!$sMat && isset($availableList[1])) $sMat = $availableList[1];
+        if (!$sIndo && isset($availableList[2])) $sIndo = $availableList[2];
+        if (!$sTik && isset($availableList[3])) $sTik = $availableList[3];
+        if (!$sIps && isset($availableList[4])) $sIps = $availableList[4];
+        if (!$sKarya && isset($availableList[5])) $sKarya = $availableList[5];
+
+        // Helper untuk memilih TP IDs riil dari mapel
+        $pickTpIds = function($subject) use ($subjectTpMap) {
+            if (!$subject) return [];
+            $sId = $subject['id'];
+            $tps = $subjectTpMap[$sId] ?? [];
+            if (empty($tps)) return [];
+            // Ambil maksimal 2 TP pertama
+            $chosen = [];
+            foreach (array_slice($tps, 0, 2) as $tp) {
+                $chosen[] = (int)$tp['id'];
+            }
+            return $chosen;
+        };
+
+        $packages = [];
+
+        // Paket 1: Gaya Hidup Berkelanjutan
+        $p1Disiplin = [];
+        if ($sIpa) {
+            $p1Disiplin[] = [
+                'subject_id' => (int)$sIpa['id'],
+                'subject_name' => $sIpa['name'],
+                'tp_ids' => $pickTpIds($sIpa),
+                'dimensi' => 'Penalaran Kritis',
+                'sub_dimensi' => 'Penyelesaian Masalah'
+            ];
+        }
+        if ($sIndo && (!$sIpa || $sIndo['id'] != $sIpa['id'])) {
+            $p1Disiplin[] = [
+                'subject_id' => (int)$sIndo['id'],
+                'subject_name' => $sIndo['name'],
+                'tp_ids' => $pickTpIds($sIndo),
+                'dimensi' => 'Komunikasi',
+                'sub_dimensi' => 'Menulis'
+            ];
+        }
+        if ($sMat && count($p1Disiplin) < 3) {
+            $p1Disiplin[] = [
+                'subject_id' => (int)$sMat['id'],
+                'subject_name' => $sMat['name'],
+                'tp_ids' => $pickTpIds($sMat),
+                'dimensi' => 'Penalaran Kritis',
+                'sub_dimensi' => 'Pengambilan Keputusan'
+            ];
+        }
+
+        $packages[] = [
+            'id' => 'paket_1',
+            'judul_paket' => !empty($focusKeyword)
+                ? 'Aksi Berkelanjutan: ' . ucwords($focusKeyword) . ' Ramah Lingkungan'
+                : (($schoolLevel == 1) 
+                    ? 'Detektif Cilik Sampah Sekolah & Kreasi Eko-Brick' 
+                    : 'Audit Sampah Mandiri & Inovasi Eko-Enzim Ramah Lingkungan'),
+            'tema' => 'Gaya Hidup Berkelanjutan',
+            'dimensi_profil' => ['Penalaran Kritis', 'Kolaborasi', 'Keimanan dan Ketakwaan Terhadap Tuhan YME'],
+            'level_kelas' => $targetClasses,
+            'jumlah_pertemuan' => 16,
+            'bentuk_kegiatan_konkret' => !empty($focusKeyword)
+                ? 'Murid mendalami topik ' . $focusKeyword . ' melalui observasi langsung di lingkungan sekolah, merancang aksi nyata ramah lingkungan, dan mempublikasikan hasil aksi dalam bentuk media kampanye.'
+                : 'Murid melakukan observasi audit volume sampah organik dan anorganik sekolah, memilah limbah, memproduksi eko-enzim/kompos, serta menggelar kampanye sekolah hijau bebas plastik.',
+            'alasan_analisis' => !empty($focusKeyword)
+                ? 'Mengaitkan fokus topik ' . $focusKeyword . ' dengan TP mata pelajaran terpilih untuk menumbuhkan kepedulian ekologis dan penalaran kritis siswa.'
+                : 'Sangat kontekstual dengan lingkungan sekolah, menumbuhkan kepedulian ekologis sekaligus memadukan analisis saintifik dan literasi kampanye publik.',
+            'lintas_disiplin' => $p1Disiplin
+        ];
+
+        // Paket 2: Kewirausahaan & Kearifan Lokal
+        $p2Disiplin = [];
+        if ($sKarya) {
+            $p2Disiplin[] = [
+                'subject_id' => (int)$sKarya['id'],
+                'subject_name' => $sKarya['name'],
+                'tp_ids' => $pickTpIds($sKarya),
+                'dimensi' => 'Kreativitas',
+                'sub_dimensi' => 'Karya'
+            ];
+        }
+        if ($sMat && (!$sKarya || $sMat['id'] != $sKarya['id'])) {
+            $p2Disiplin[] = [
+                'subject_id' => (int)$sMat['id'],
+                'subject_name' => $sMat['name'],
+                'tp_ids' => $pickTpIds($sMat),
+                'dimensi' => 'Penalaran Kritis',
+                'sub_dimensi' => 'Pengambilan Keputusan'
+            ];
+        }
+        if ($sIndo && count($p2Disiplin) < 3) {
+            $p2Disiplin[] = [
+                'subject_id' => (int)$sIndo['id'],
+                'subject_name' => $sIndo['name'],
+                'tp_ids' => $pickTpIds($sIndo),
+                'dimensi' => 'Komunikasi',
+                'sub_dimensi' => 'Berbicara'
+            ];
+        }
+
+        $packages[] = [
+            'id' => 'paket_2',
+            'judul_paket' => !empty($focusKeyword)
+                ? 'Kewirausahaan Kreatif Berbasis ' . ucwords($focusKeyword)
+                : (($schoolLevel == 1)
+                    ? 'Market Day Cilik: Ragam Kuliner Sehat Tradisional'
+                    : 'Inkubator Wirausaha Muda: Eksplorasi Produk Kreatif Berbasis Kearifan Lokal'),
+            'tema' => 'Kewirausahaan',
+            'dimensi_profil' => ['Kreativitas', 'Kemandirian', 'Kolaborasi'],
+            'level_kelas' => $targetClasses,
+            'jumlah_pertemuan' => 16,
+            'bentuk_kegiatan_konkret' => !empty($focusKeyword)
+                ? 'Murid meriset potensi nilai ekonomis dari ' . $focusKeyword . ', merancang produk olahan atau karya inovatif, menghitung anggaran sederhana, dan menyelenggarakan pameran karya sekolah.'
+                : 'Murid meriset potensi bahan lokal, merancang produk olahan kreatif bernilai ekonomis, menghitung biaya produksi serta laba/rugi, dan menyelenggarakan pameran mini wirausaha sekolah.',
+            'alasan_analisis' => !empty($focusKeyword)
+                ? 'Mengintegrasikan eksplorasi ' . $focusKeyword . ' dengan capaian pembelajaran prakarya/matematika untuk melatih jiwa kepemimpinan dan kemandirian.'
+                : 'Membangun karakter pantang menyerah, jiwa inovasi, kepemimpinan kerja tim, dan literasi finansial praktis sejak dini.',
+            'lintas_disiplin' => $p2Disiplin
+        ];
+
+        // Paket 3: Rekayasa dan Teknologi
+        $p3Disiplin = [];
+        if ($sTik) {
+            $p3Disiplin[] = [
+                'subject_id' => (int)$sTik['id'],
+                'subject_name' => $sTik['name'],
+                'tp_ids' => $pickTpIds($sTik),
+                'dimensi' => 'Kreativitas',
+                'sub_dimensi' => 'Gagasan baru'
+            ];
+        }
+        if ($sIpa && (!$sTik || $sIpa['id'] != $sTik['id'])) {
+            $p3Disiplin[] = [
+                'subject_id' => (int)$sIpa['id'],
+                'subject_name' => $sIpa['name'],
+                'tp_ids' => $pickTpIds($sIpa),
+                'dimensi' => 'Penalaran Kritis',
+                'sub_dimensi' => 'Penyelesaian Masalah'
+            ];
+        }
+        if ($sIndo && count($p3Disiplin) < 3) {
+            $p3Disiplin[] = [
+                'subject_id' => (int)$sIndo['id'],
+                'subject_name' => $sIndo['name'],
+                'tp_ids' => $pickTpIds($sIndo),
+                'dimensi' => 'Komunikasi',
+                'sub_dimensi' => 'Menulis'
+            ];
+        }
+
+        $packages[] = [
+            'id' => 'paket_3',
+            'judul_paket' => !empty($focusKeyword)
+                ? 'Inovasi Rekayasa Teknologi: ' . ucwords($focusKeyword)
+                : (($schoolLevel == 1)
+                    ? 'Teknologi Sederhana Sahabat Lingkungan: Rancang Alat Penyaring Air Bersih'
+                    : 'Inovasi Digital & Rancang Bangun Teknologi Tepat Guna untuk Solusi Lingkungan'),
+            'tema' => 'Rekayasa dan Teknologi',
+            'dimensi_profil' => ['Penalaran Kritis', 'Kreativitas', 'Kolaborasi'],
+            'level_kelas' => $targetClasses,
+            'jumlah_pertemuan' => 16,
+            'bentuk_kegiatan_konkret' => !empty($focusKeyword)
+                ? 'Murid mengidentifikasi masalah terkait ' . $focusKeyword . ', merancang model prototipe alat tepat guna atau media teknologi, menguji coba fungsi, dan menyusun laporan unjuk kerja.'
+                : 'Murid mengidentifikasi kendala fisik/lingkungan di sekitar sekolah, merancang model prototipe alat tepat guna atau media interaktif digital, menguji coba fungsi, dan menyusun laporan unjuk kerja.',
+            'alasan_analisis' => !empty($focusKeyword)
+                ? 'Mendorong pemikiran komputasional dan rekayasa sains berbasis isu ' . $focusKeyword . ' melalui kolaborasi lintas mapel TIK, IPA, dan Bahasa.'
+                : 'Menstimulasi daya rekayasa (computational/engineering thinking), kolaborasi pemecahan masalah, dan keberanian bereksperimen dengan teknologi ramah lingkungan.',
+            'lintas_disiplin' => $p3Disiplin
+        ];
+
+        return $packages;
+    }
+
+    /**
+     * View/Detail Document
+     */
+    public function view($id)
+    {
+        $document = $this->documentModel->getDocumentWithDetails($id);
+        
+        if (!$document) {
+            return redirect()->back()->with('error', 'Dokumen tidak ditemukan');
+        }
+
+        // Check access - Admin, Kepsek, atau creator
+        $user = session()->get('user');
+        $roleId = $user['role_id'] ?? 0;
+        if (!in_array($roleId, [1, 2]) && $document['created_by'] != $user['id']) {
+            return redirect()->back()->with('error', 'Anda tidak memiliki akses');
+        }
+
+        // Get subject names and TPs if lintas disiplin
+        $subjectNames = [];
+        $subjectTPs = [];
+        $jenisKokurikuler = $this->getJenisKokurikuler($document);
+        
+        if ($jenisKokurikuler === 'lintas_disiplin') {
+            $detail = json_decode($document['kegiatan_detail'], true);
+            
+            // Log the detail for debugging
+            log_message('info', 'Kokurikuler View - kegiatan_detail: ' . $document['kegiatan_detail']);
+            log_message('info', 'Kokurikuler View - decoded detail: ' . json_encode($detail));
+            
+            if ($detail && isset($detail['items']) && is_array($detail['items'])) {
+                // New format: items array with subject_id, tp_id, dimensi_profil
+                log_message('info', 'Kokurikuler View - Using NEW format with items array');
+                
+                foreach ($detail['items'] as $item) {
+                    $subjectId = $item['subject_id'];
+                    $tpId = $item['tp_id'];
+                    $dimensi = $item['dimensi_profil'];
+                    
+                    // Get subject name
+                    if (!isset($subjectNames[$subjectId])) {
+                        $subject = $this->subjectModel->find($subjectId);
+                        if ($subject) {
+                            $subjectNames[$subjectId] = $subject['name'];
+                            $subjectTPs[$subjectId] = [];
+                        }
+                    }
+                    
+                    // Get TP data
+                    $tp = $this->tpModel->find($tpId);
+                    if ($tp) {
+                        $subjectTPs[$subjectId][] = [
+                            'id' => $tp['id'],
+                            'kode_tp' => $tp['kode_tp'],
+                            'deskripsi' => $tp['deskripsi'],
+                            'dimensi_profil' => $dimensi,
+                            'sub_dimensi' => $item['sub_dimensi'] ?? ''
+                        ];
+                        log_message('info', "Kokurikuler View - Found TP $tpId for subject $subjectId with dimensi: $dimensi, sub_dimensi: " . ($item['sub_dimensi'] ?? 'none'));
+                    }
+                }
+            } elseif ($detail && isset($detail['subjects']) && is_array($detail['subjects'])) {
+                // Old format: subjects array with separate tujuan_pembelajaran array
+                log_message('info', 'Kokurikuler View - Using OLD format with subjects array');
+                
+                $tpData = $detail['tujuan_pembelajaran'] ?? [];
+                $isOldFormat = !empty($tpData) && !is_array($tpData[0]);
+                
+                log_message('info', 'Kokurikuler View - TP Data format: ' . ($isOldFormat ? 'OLD (flat)' : 'NEW (2D)'));
+                
+                foreach ($detail['subjects'] as $index => $subjectId) {
+                    $subject = $this->subjectModel->find($subjectId);
+                    if ($subject) {
+                        $subjectNames[$subjectId] = $subject['name'];
+                        
+                        log_message('info', "Kokurikuler View - Subject $index (ID: $subjectId): " . $subject['name']);
+                        
+                        // Get TPs for this subject
+                        $tpIds = [];
+                        
+                        if ($isOldFormat) {
+                            // Old format: flat array, all TPs in one array
+                            $tpIds = $tpData;
+                            log_message('info', "Kokurikuler View - Using OLD format, all TPs: " . json_encode($tpIds));
+                        } else {
+                            // New format: 2D array, TPs grouped by subject
+                            if (isset($tpData[$index]) && is_array($tpData[$index])) {
+                                $tpIds = $tpData[$index];
+                                log_message('info', "Kokurikuler View - Using NEW format, TP IDs for subject $index: " . json_encode($tpIds));
+                            }
+                        }
+                        
+                        if (!empty($tpIds)) {
+                            $tps = [];
+                            foreach ($tpIds as $tpId) {
+                                $tp = $this->tpModel->find($tpId);
+                                if ($tp) {
+                                    $tps[] = [
+                                        'id' => $tp['id'],
+                                        'kode_tp' => $tp['kode_tp'],
+                                        'deskripsi' => $tp['deskripsi']
+                                    ];
+                                    log_message('info', "Kokurikuler View - Found TP $tpId: " . $tp['kode_tp'] . ' - ' . $tp['deskripsi']);
+                                } else {
+                                    log_message('warning', "Kokurikuler View - TP $tpId not found in database");
+                                }
+                            }
+                            $subjectTPs[$subjectId] = $tps;
+                        } else {
+                            log_message('warning', "Kokurikuler View - No TPs found for subject index $index");
+                        }
+                    }
+                }
+            }
+            
+            log_message('info', 'Kokurikuler View - Final subjectTPs: ' . json_encode($subjectTPs));
+        }
+
+        return view('admin/kokurikuler/view', [
+            'title' => 'Detail Dokumen Kokurikuler',
+            'document' => $document,
+            'subjectNames' => $subjectNames,
+            'subjectTPs' => $subjectTPs
+        ]);
+    }
+
+    /**
+     * Export to PDF
+     */
+    public function exportPDF($id)
+    {
+        $document = $this->documentModel->getDocumentWithDetails($id);
+        
+        if (!$document) {
+            return redirect()->back()->with('error', 'Dokumen tidak ditemukan');
+        }
+
+        // Check access
+        $user = session()->get('user');
+        if ($user['role_id'] != 1 && $document['created_by'] != $user['id']) {
+            return redirect()->back()->with('error', 'Anda tidak memiliki akses');
+        }
+
+        // Check if document is completed
+        if ($document['status'] !== 'completed') {
+            return redirect()->back()->with('error', 'Dokumen belum selesai. Silakan generate AI terlebih dahulu.');
+        }
+
+        // Get school info including principal
+        $db = \Config\Database::connect();
+        $school = $db->table('school_profile')->get()->getRowArray();
+        $document['school_name'] = $school['name'] ?? 'Nama Sekolah';
+        $document['headmaster'] = $school['headmaster'] ?? '';
+        $document['principal_nip'] = $school['principal_nip'] ?? '';
+        $document['city_regency'] = $school['city_regency'] ?? '';
+
+        // Get teacher info (creator or wali kelas yang menggunakan template)
+        $teacherModel = new \App\Models\TeacherModel();
+        $userModel = new \App\Models\UserModel();
+        
+        // Jika dokumen ini digunakan oleh wali kelas (used_by_teacher_id), gunakan data wali kelas
+        if (!empty($document['used_by_teacher_id'])) {
+            $teacher = $teacherModel->find($document['used_by_teacher_id']);
+            if ($teacher) {
+                $document['teacher_name'] = $teacher['name'];
+                $document['teacher_nip'] = $teacher['nip'] ?? '';
+            } else {
+                $document['teacher_name'] = 'Wali Kelas';
+                $document['teacher_nip'] = '';
+            }
+        } else {
+            // Gunakan data creator
+            $creator = $userModel->find($document['created_by']);
+            if ($creator && $creator['related_type'] === 'teacher' && $creator['related_id']) {
+                $teacher = $teacherModel->find($creator['related_id']);
+                if ($teacher) {
+                    $document['teacher_name'] = $teacher['name'];
+                    $document['teacher_nip'] = $teacher['nip'] ?? '';
+                }
+            }
+            
+            // Fallback to creator name if teacher not found
+            if (!isset($document['teacher_name'])) {
+                $document['teacher_name'] = $document['creator_name'] ?? '';
+                $document['teacher_nip'] = '';
+            }
+        }
+
+        // Get subject names and TPs if lintas disiplin
+        $subjectNames = [];
+        $subjectTPs = [];
+        $jenisKokurikuler = $this->getJenisKokurikuler($document);
+        
+        if ($jenisKokurikuler === 'lintas_disiplin') {
+            $detail = json_decode($document['kegiatan_detail'], true);
+            
+            if ($detail && isset($detail['items']) && is_array($detail['items'])) {
+                // New format: items array with subject_id, tp_id, dimensi_profil
+                log_message('info', 'ExportPDF - Using NEW format with items array');
+                
+                foreach ($detail['items'] as $item) {
+                    $subjectId = $item['subject_id'];
+                    $tpId = $item['tp_id'];
+                    $dimensi = $item['dimensi_profil'];
+                    
+                    // Get subject name
+                    if (!isset($subjectNames[$subjectId])) {
+                        $subject = $this->subjectModel->find($subjectId);
+                        if ($subject) {
+                            $subjectNames[$subjectId] = $subject['name'];
+                            $subjectTPs[$subjectId] = [];
+                        }
+                    }
+                    
+                    // Get TP data
+                    $tp = $this->tpModel->find($tpId);
+                    if ($tp) {
+                        $subjectTPs[$subjectId][] = [
+                            'id' => $tp['id'],
+                            'kode_tp' => $tp['kode_tp'],
+                            'deskripsi' => $tp['deskripsi'],
+                            'dimensi_profil' => $dimensi,
+                            'sub_dimensi' => $item['sub_dimensi'] ?? ''
+                        ];
+                    }
+                }
+            } elseif ($detail && isset($detail['subjects']) && is_array($detail['subjects'])) {
+                // Old format: subjects array with separate tujuan_pembelajaran array
+                log_message('info', 'ExportPDF - Using OLD format with subjects array');
+                
+                $tpData = $detail['tujuan_pembelajaran'] ?? [];
+                $isOldFormat = !empty($tpData) && !is_array($tpData[0]);
+                
+                foreach ($detail['subjects'] as $index => $subjectId) {
+                    $subject = $this->subjectModel->find($subjectId);
+                    if ($subject) {
+                        $subjectNames[$subjectId] = $subject['name'];
+                        
+                        // Get TPs for this subject
+                        $tpIds = [];
+                        
+                        if ($isOldFormat) {
+                            // Old format: flat array, all TPs in one array
+                            $tpIds = $tpData;
+                        } else {
+                            // New format: 2D array, TPs grouped by subject
+                            if (isset($tpData[$index]) && is_array($tpData[$index])) {
+                                $tpIds = $tpData[$index];
+                            }
+                        }
+                        
+                        if (!empty($tpIds)) {
+                            $tps = [];
+                            foreach ($tpIds as $tpId) {
+                                $tp = $this->tpModel->find($tpId);
+                                if ($tp) {
+                                    $tps[] = [
+                                        'id' => $tp['id'],
+                                        'kode_tp' => $tp['kode_tp'],
+                                        'deskripsi' => $tp['deskripsi']
+                                    ];
+                                }
+                            }
+                            $subjectTPs[$subjectId] = $tps;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Select template based on jenis_kokurikuler
+        $template = match($jenisKokurikuler) {
+            'lintas_disiplin' => 'admin/kokurikuler/pdf_lintas_disiplin',
+            '7kaih' => 'admin/kokurikuler/pdf_7kaih',
+            'lainnya' => 'admin/kokurikuler/pdf_lainnya',
+            default => 'admin/kokurikuler/pdf_lainnya'
+        };
+
+        // Generate PDF
+        $dompdf = new \Dompdf\Dompdf();
+        $html = view($template, [
+            'document' => $document,
+            'subjectNames' => $subjectNames,
+            'subjectTPs' => $subjectTPs
+        ]);
+        
+        $dompdf->loadHtml($html);
+        $dompdf->setPaper('A4', 'portrait');
+        $dompdf->render();
+        
+        $filename = 'Kokurikuler_' . preg_replace('/[^A-Za-z0-9_\-]/', '_', $document['tema']) . '_' . date('YmdHis') . '.pdf';
+        if (ob_get_length()) {
+            @ob_end_clean();
+        }
+        $dompdf->stream($filename, ['Attachment' => true]);
+        exit;
+    }
+
+    /**
+     * Delete Document
+     */
+    public function delete($id)
+    {
+        $document = $this->documentModel->find($id);
+        
+        if (!$document) {
+            return redirect()->back()->with('error', 'Dokumen tidak ditemukan');
+        }
+
+        // Check access
+        $user = session()->get('user');
+        if ($user['role_id'] != 1 && $document['created_by'] != $user['id']) {
+            return redirect()->back()->with('error', 'Anda tidak memiliki akses');
+        }
+
+        $this->documentModel->delete($id);
+        return redirect()->to('admin/kokurikuler')->with('success', 'Dokumen berhasil dihapus');
+    }
+
+    /**
+     * Pelaksanaan - Coming Soon (Tahap 2)
+     */
+    public function pelaksanaan()
+    {
+        $user = session()->get('user');
+        $roleId = $user['role_id'] ?? 0;
+        $userId = $user['id'] ?? 0;
+
+        // Admin, Kepsek, dan Guru Kelas bisa akses
+        if (!in_array($roleId, [1, 2, 3])) {
+            return redirect()->back()->with('error', 'Anda tidak memiliki akses ke modul ini.');
+        }
+
+        // Get documents yang sudah completed (hanya yang bisa dilaksanakan)
+        $documents = $this->documentModel
+            ->select('kokurikuler_documents.*, academic_years.year as year_name')
+            ->join('academic_years', 'academic_years.id = kokurikuler_documents.year_id', 'left')
+            ->where('kokurikuler_documents.status', 'completed');
+
+        // Filter untuk guru kelas
+        if ($roleId == 3) {
+            $db = \Config\Database::connect();
+            $userRecord = $db->table('users')->where('id', $userId)->get()->getRow();
+            $teacherId = $userRecord->related_id ?? 0;
+            
+            $documents->groupStart()
+                ->where('kokurikuler_documents.created_by', $userId)
+                ->orWhere('kokurikuler_documents.used_by_teacher_id', $teacherId)
+                ->groupEnd();
+        }
+        // Kepsek bisa lihat semua (tidak perlu filter)
+
+        $documents = $documents->orderBy('kokurikuler_documents.created_at', 'DESC')->findAll();
+
+        // Get summary untuk setiap dokumen
+        foreach ($documents as &$doc) {
+            $doc['summary'] = $this->pelaksanaanModel->getSummary($doc['id']);
+        }
+
+        return view('admin/kokurikuler/pelaksanaan', [
+            'title' => 'Pelaksanaan Kokurikuler',
+            'documents' => $documents,
+            'isReadOnly' => ($roleId == 2), // Kepsek read-only
+        ]);
+    }
+
+    /**
+     * Detail Pelaksanaan - Form untuk input pelaksanaan per kegiatan
+     */
+    public function pelaksanaanDetail($documentId)
+    {
+        $user = session()->get('user');
+        $roleId = $user['role_id'] ?? 0;
+        $userId = $user['id'] ?? 0;
+
+        // Kepsek tidak bisa create/edit pelaksanaan
+        if (!in_array($roleId, [1, 3])) {
+            return redirect()->back()->with('error', 'Anda tidak memiliki akses.');
+        }
+
+        // Get document
+        $document = $this->documentModel->getDocumentWithDetails($documentId);
+        if (!$document) {
+            return redirect()->back()->with('error', 'Dokumen tidak ditemukan.');
+        }
+
+        // Check access
+        if ($roleId == 3) {
+            $db = \Config\Database::connect();
+            $userRecord = $db->table('users')->where('id', $userId)->get()->getRow();
+            $teacherId = $userRecord->related_id ?? 0;
+            
+            if ($document['created_by'] != $userId && $document['used_by_teacher_id'] != $teacherId) {
+                return redirect()->back()->with('error', 'Anda tidak memiliki akses ke dokumen ini.');
+            }
+        }
+
+        // Check if document is completed
+        if ($document['status'] !== 'completed') {
+            return redirect()->back()->with('error', 'Dokumen belum selesai. Hanya dokumen yang sudah selesai yang bisa dilaksanakan.');
+        }
+
+        // Initialize pelaksanaan records if not exists
+        $this->pelaksanaanModel->initializePelaksanaan($documentId, $document['jumlah_pertemuan'], $userId);
+
+        // Get kegiatan kokurikuler
+        $kegiatanList = json_decode($document['kegiatan_kokurikuler'], true);
+
+        // Get pelaksanaan data
+        $pelaksanaanData = $this->pelaksanaanModel->getPelaksanaanByDocument($documentId);
+        
+        // Map pelaksanaan by pertemuan_ke
+        $pelaksanaanMap = [];
+        foreach ($pelaksanaanData as $p) {
+            $pelaksanaanMap[$p['pertemuan_ke']] = $p;
+        }
+
+        return view('admin/kokurikuler/pelaksanaan_detail', [
+            'title' => 'Detail Pelaksanaan - ' . $document['tema'],
+            'document' => $document,
+            'kegiatanList' => $kegiatanList,
+            'pelaksanaanMap' => $pelaksanaanMap,
+        ]);
+    }
+
+    /**
+     * Save Pelaksanaan - Simpan data pelaksanaan
+     */
+    public function savePelaksanaan()
+    {
+        if (!$this->request->isAJAX()) {
+            return redirect()->back()->with('error', 'Invalid request');
+        }
+
+        $user = session()->get('user');
+        $userId = $user['id'] ?? 0;
+
+        $pelaksanaanId = $this->request->getPost('pelaksanaan_id');
+        $status = $this->request->getPost('status');
+
+        $data = [
+            'status' => $status,
+        ];
+
+        if ($status === 'terlaksana') {
+            $data['tanggal_pelaksanaan'] = $this->request->getPost('tanggal_pelaksanaan');
+            $data['catatan_pelaksanaan'] = $this->request->getPost('catatan_pelaksanaan');
+            $data['alasan_tidak_terlaksana'] = null;
+
+            // Handle file upload - hanya simpan satu file (file baru menimpa file lama)
+            $files = $this->request->getFiles();
+            if (isset($files['dokumentasi'])) {
+                $hasNewFile = false;
+                foreach ($files['dokumentasi'] as $file) {
+                    if ($file->isValid() && !$file->hasMoved()) {
+                        $hasNewFile = true;
+                        break;
+                    }
+                }
+                
+                if ($hasNewFile) {
+                    // Hapus file lama jika ada
+                    $oldData = $this->pelaksanaanModel->find($pelaksanaanId);
+                    if ($oldData && !empty($oldData['dokumentasi'])) {
+                        $oldFiles = json_decode($oldData['dokumentasi'], true);
+                        if (is_array($oldFiles)) {
+                            foreach ($oldFiles as $oldFile) {
+                                $oldFilePath = FCPATH . $oldFile;
+                                if (file_exists($oldFilePath)) {
+                                    @unlink($oldFilePath);
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Upload file baru (hanya satu file)
+                    $uploadedFile = null;
+                    foreach ($files['dokumentasi'] as $file) {
+                        if ($file->isValid() && !$file->hasMoved()) {
+                            $newName = $file->getRandomName();
+                            
+                            $uploadPath = FCPATH . 'uploads/kokurikuler/';
+                            if (!is_dir($uploadPath)) {
+                                mkdir($uploadPath, 0755, true);
+                            }
+                            
+                            $file->move($uploadPath, $newName);
+                            $uploadedFile = 'uploads/kokurikuler/' . $newName;
+                            break; // Hanya ambil file pertama
+                        }
+                    }
+                    
+                    if ($uploadedFile) {
+                        $data['dokumentasi'] = json_encode([$uploadedFile]);
+                    }
+                }
+            }
+        } elseif ($status === 'tidak_terlaksana') {
+            $data['alasan_tidak_terlaksana'] = $this->request->getPost('alasan_tidak_terlaksana');
+            $data['tanggal_pelaksanaan'] = null;
+            $data['catatan_pelaksanaan'] = null;
+            
+            // Hapus file dokumentasi jika ada
+            $oldData = $this->pelaksanaanModel->find($pelaksanaanId);
+            if ($oldData && !empty($oldData['dokumentasi'])) {
+                $oldFiles = json_decode($oldData['dokumentasi'], true);
+                if (is_array($oldFiles)) {
+                    foreach ($oldFiles as $oldFile) {
+                        $oldFilePath = FCPATH . $oldFile;
+                        if (file_exists($oldFilePath)) {
+                            @unlink($oldFilePath);
+                        }
+                    }
+                }
+            }
+            $data['dokumentasi'] = null;
+        } elseif ($status === 'belum_dilaksanakan') {
+            // Hapus semua data jika kembali ke belum dilaksanakan
+            $data['tanggal_pelaksanaan'] = null;
+            $data['catatan_pelaksanaan'] = null;
+            $data['alasan_tidak_terlaksana'] = null;
+            
+            // Hapus file dokumentasi jika ada
+            $oldData = $this->pelaksanaanModel->find($pelaksanaanId);
+            if ($oldData && !empty($oldData['dokumentasi'])) {
+                $oldFiles = json_decode($oldData['dokumentasi'], true);
+                if (is_array($oldFiles)) {
+                    foreach ($oldFiles as $oldFile) {
+                        $oldFilePath = FCPATH . $oldFile;
+                        if (file_exists($oldFilePath)) {
+                            @unlink($oldFilePath);
+                        }
+                    }
+                }
+            }
+            $data['dokumentasi'] = null;
+        }
+
+        try {
+            $this->pelaksanaanModel->update($pelaksanaanId, $data);
+
+            return $this->response->setJSON([
+                'success' => true,
+                'message' => 'Data pelaksanaan berhasil disimpan.'
+            ]);
+        } catch (\Exception $e) {
+            log_message('error', 'Save pelaksanaan error: ' . $e->getMessage());
+            return $this->response->setJSON([
+                'success' => false,
+                'message' => 'Gagal menyimpan data: ' . $e->getMessage()
+            ]);
+        }
+    }
+
+    /**
+     * Serve File - Serve uploaded files from writable directory
+     */
+    public function serveFile($filename)
+    {
+        $user = session()->get('user');
+        $roleId = $user['role_id'] ?? 0;
+
+        // Only admin and guru kelas can access
+        if (!in_array($roleId, [1, 3])) {
+            return redirect()->back()->with('error', 'Anda tidak memiliki akses.');
+        }
+
+        // Decode filename (in case it has special characters)
+        $filename = urldecode($filename);
+        
+        // Security: prevent directory traversal
+        $filename = str_replace(['..', '\\', '/'], '', $filename);
+        
+        $filePath = FCPATH . 'uploads/kokurikuler/' . $filename;
+
+        if (!file_exists($filePath)) {
+            log_message('error', 'File not found: ' . $filePath);
+            return $this->response->setStatusCode(404, 'File not found');
+        }
+
+        // Get mime type
+        $finfo = finfo_open(FILEINFO_MIME_TYPE);
+        $mimeType = finfo_file($finfo, $filePath);
+        finfo_close($finfo);
+
+        // Set headers
+        $this->response->setHeader('Content-Type', $mimeType);
+        $this->response->setHeader('Content-Length', filesize($filePath));
+        
+        // For images and PDFs, display inline; for others, download
+        if (strpos($mimeType, 'image/') === 0 || $mimeType === 'application/pdf') {
+            $this->response->setHeader('Content-Disposition', 'inline; filename="' . basename($filePath) . '"');
+        } else {
+            $this->response->setHeader('Content-Disposition', 'attachment; filename="' . basename($filePath) . '"');
+        }
+
+        // Output file
+        $this->response->setBody(file_get_contents($filePath));
+        return $this->response;
+    }
+
+    /**
+     * Penilaian/Asesmen - Coming Soon (Tahap 3)
+     */
+    public function penilaian()
+    {
+        $user = session()->get('user');
+        $roleId = $user['role_id'] ?? 0;
+        $userId = $user['id'] ?? 0;
+
+        // Admin, Kepsek, dan Guru Kelas bisa akses
+        if (!in_array($roleId, [1, 2, 3])) {
+            return redirect()->back()->with('error', 'Anda tidak memiliki akses ke modul ini.');
+        }
+
+        // Get documents yang sudah completed (hanya yang bisa dinilai)
+        $documents = $this->documentModel
+            ->select('kokurikuler_documents.*, academic_years.year as year_name')
+            ->join('academic_years', 'academic_years.id = kokurikuler_documents.year_id', 'left')
+            ->where('kokurikuler_documents.status', 'completed');
+
+        // Filter untuk guru kelas
+        if ($roleId == 3) {
+            $db = \Config\Database::connect();
+            $userRecord = $db->table('users')->where('id', $userId)->get()->getRow();
+            $teacherId = $userRecord->related_id ?? 0;
+            
+            $documents->groupStart()
+                ->where('kokurikuler_documents.created_by', $userId)
+                ->orWhere('kokurikuler_documents.used_by_teacher_id', $teacherId)
+                ->groupEnd();
+        }
+        // Kepsek bisa lihat semua (tidak perlu filter)
+
+        $documents = $documents->orderBy('kokurikuler_documents.created_at', 'DESC')->findAll();
+
+        // Get summary untuk setiap dokumen
+        foreach ($documents as &$doc) {
+            // Generate rubrik if not exists
+            $this->rubrikModel->generateRubrikFromDocument($doc['id']);
+            
+            // Get penilaian summary
+            $doc['summary'] = $this->penilaianModel->getSummary($doc['id']);
+        }
+
+        return view('admin/kokurikuler/penilaian', [
+            'title' => 'Penilaian/Asesmen Kokurikuler',
+            'documents' => $documents,
+            'isReadOnly' => ($roleId == 2), // Kepsek read-only
+        ]);
+    }
+
+    /**
+     * Detail Penilaian - Daftar siswa dengan status penilaian
+     */
+    public function penilaianDetail($documentId)
+    {
+        $user = session()->get('user');
+        $roleId = $user['role_id'] ?? 0;
+        $userId = $user['id'] ?? 0;
+
+        if (!in_array($roleId, [1, 3])) {
+            return redirect()->back()->with('error', 'Anda tidak memiliki akses.');
+        }
+
+        // Get document
+        $document = $this->documentModel->getDocumentWithDetails($documentId);
+        if (!$document) {
+            return redirect()->back()->with('error', 'Dokumen tidak ditemukan.');
+        }
+
+        // Check access
+        if ($roleId == 3) {
+            $db = \Config\Database::connect();
+            $userRecord = $db->table('users')->where('id', $userId)->get()->getRow();
+            $teacherId = $userRecord->related_id ?? 0;
+            
+            if ($document['created_by'] != $userId && $document['used_by_teacher_id'] != $teacherId) {
+                return redirect()->back()->with('error', 'Anda tidak memiliki akses ke dokumen ini.');
+            }
+        }
+
+        // Check if document is completed
+        if ($document['status'] !== 'completed') {
+            return redirect()->back()->with('error', 'Dokumen belum selesai. Hanya dokumen yang sudah selesai yang bisa dinilai.');
+        }
+
+        // Generate rubrik if not exists
+        $this->rubrikModel->generateRubrikFromDocument($documentId);
+
+        // Get students with penilaian status
+        $students = $this->penilaianModel->getStudentsWithPenilaianStatus($documentId);
+
+        // Get summary
+        $summary = $this->penilaianModel->getSummary($documentId);
+
+        return view('admin/kokurikuler/penilaian_detail', [
+            'title' => 'Penilaian - ' . $document['tema'],
+            'document' => $document,
+            'students' => $students,
+            'summary' => $summary,
+        ]);
+    }
+
+    /**
+     * Form Penilaian Per Siswa
+     */
+    public function penilaianForm($documentId, $studentId)
+    {
+        log_message('info', '=== PENILAIAN FORM START === Document: ' . $documentId . ', Student: ' . $studentId);
+        
+        // Set JSON header
+        $this->response->setContentType('application/json');
+        
+        log_message('info', 'PenilaianForm - Request URI: ' . $this->request->getUri());
+        log_message('info', 'PenilaianForm - Is AJAX: ' . ($this->request->isAJAX() ? 'yes' : 'no'));
+        
+        if (!$this->request->isAJAX()) {
+            log_message('warning', 'PenilaianForm - Not an AJAX request');
+            return $this->response->setJSON(['success' => false, 'message' => 'Invalid request type']);
+        }
+
+        $user = session()->get('user');
+        log_message('info', 'PenilaianForm - User session: ' . json_encode($user));
+        
+        if (!$user) {
+            log_message('error', 'PenilaianForm - No user session found');
+            return $this->response->setJSON(['success' => false, 'message' => 'Session expired. Please login again.']);
+        }
+        
+        $roleId = $user['role_id'] ?? 0;
+
+        if (!in_array($roleId, [1, 3])) {
+            log_message('error', 'PenilaianForm - Access denied for role: ' . $roleId);
+            return $this->response->setJSON(['success' => false, 'message' => 'Akses ditolak']);
+        }
+
+        try {
+            // Generate rubrik if not exists (skip if already exists)
+            log_message('info', 'PenilaianForm - Checking rubrik for document: ' . $documentId);
+            
+            // Direct query to check rubrik
+            $db = \Config\Database::connect();
+            $rubrikCount = $db->table('kokurikuler_rubrik')
+                ->where('document_id', $documentId)
+                ->countAllResults();
+            
+            log_message('info', 'PenilaianForm - Direct query rubrik count: ' . $rubrikCount);
+            
+            $existingRubrik = $this->rubrikModel->getRubrikByDocument($documentId);
+            
+            log_message('info', 'PenilaianForm - Model query rubrik count: ' . count($existingRubrik));
+            
+            if (empty($existingRubrik)) {
+                log_message('info', 'PenilaianForm - No rubrik found, generating for document: ' . $documentId);
+                
+                // Get document to check if it's completed
+                $document = $this->documentModel->find($documentId);
+                if (!$document) {
+                    log_message('error', 'PenilaianForm - Document not found: ' . $documentId);
+                    return $this->response->setJSON([
+                        'success' => false,
+                        'message' => 'Dokumen tidak ditemukan'
+                    ]);
+                }
+                
+                log_message('info', 'PenilaianForm - Document status: ' . $document['status']);
+                
+                if ($document['status'] !== 'completed') {
+                    log_message('error', 'PenilaianForm - Document not completed: ' . $documentId);
+                    return $this->response->setJSON([
+                        'success' => false,
+                        'message' => 'Dokumen belum selesai. Hanya dokumen yang sudah selesai yang bisa dinilai.'
+                    ]);
+                }
+                
+                // Delete existing rubrik first (in case of partial insert)
+                log_message('info', 'PenilaianForm - Deleting existing rubrik (if any)');
+                $db->table('kokurikuler_rubrik')->where('document_id', $documentId)->delete();
+                
+                $generated = $this->rubrikModel->generateRubrikFromDocument($documentId);
+                log_message('info', 'PenilaianForm - Generate result: ' . ($generated ? 'success' : 'failed'));
+                
+                // Re-fetch rubrik after generation
+                $existingRubrik = $this->rubrikModel->getRubrikByDocument($documentId);
+                log_message('info', 'PenilaianForm - Rubrik count after generation: ' . count($existingRubrik));
+                
+                if (empty($existingRubrik)) {
+                    log_message('error', 'PenilaianForm - Failed to generate rubrik for document: ' . $documentId);
+                    
+                    // Check if document has required data
+                    log_message('error', 'PenilaianForm - Document data: ' . json_encode($document));
+                    
+                    return $this->response->setJSON([
+                        'success' => false,
+                        'message' => 'Gagal membuat rubrik penilaian. Silakan hubungi administrator.'
+                    ]);
+                }
+            }
+            
+            log_message('info', 'PenilaianForm - Final rubrik count: ' . count($existingRubrik));
+            
+            if (!empty($existingRubrik)) {
+                log_message('info', 'PenilaianForm - First rubrik item: ' . json_encode($existingRubrik[0]));
+            }
+
+            // Get existing penilaian
+            $penilaian = $this->penilaianModel->getPenilaianByStudentAndDocument($studentId, $documentId);
+            log_message('info', 'PenilaianForm - Penilaian data: ' . json_encode($penilaian));
+
+            // Get student info
+            $db = \Config\Database::connect();
+            $student = $db->table('students')->where('id', $studentId)->get()->getRowArray();
+            log_message('info', 'PenilaianForm - Student data: ' . json_encode($student));
+
+            return $this->response->setJSON([
+                'success' => true,
+                'rubrik' => $existingRubrik,
+                'penilaian' => $penilaian,
+                'student' => $student,
+                'debug' => [
+                    'document_id' => $documentId,
+                    'student_id' => $studentId,
+                    'rubrik_count' => count($existingRubrik),
+                    'timestamp' => date('Y-m-d H:i:s'),
+                ],
+            ]);
+        } catch (\Exception $e) {
+            log_message('error', 'PenilaianForm error: ' . $e->getMessage());
+            log_message('error', 'Stack trace: ' . $e->getTraceAsString());
+            
+            return $this->response->setJSON([
+                'success' => false,
+                'message' => 'Error: ' . $e->getMessage()
+            ]);
+        }
+    }
+
+    /**
+     * Save Penilaian
+     */
+    public function savePenilaian()
+    {
+        if (!$this->request->isAJAX()) {
+            return redirect()->back()->with('error', 'Invalid request');
+        }
+
+        $user = session()->get('user');
+        $userId = $user['id'] ?? 0;
+
+        $documentId = $this->request->getPost('document_id');
+        $studentId = $this->request->getPost('student_id');
+        $penilaianDetail = $this->request->getPost('penilaian_detail'); // JSON string
+        $catatanTambahan = $this->request->getPost('catatan_tambahan');
+
+        // Validation
+        if (!$documentId || !$studentId || !$penilaianDetail) {
+            return $this->response->setJSON([
+                'success' => false,
+                'message' => 'Data tidak lengkap'
+            ]);
+        }
+
+        // Check if penilaian already exists
+        $existing = $this->penilaianModel->getPenilaianByStudentAndDocument($studentId, $documentId);
+
+        $data = [
+            'document_id' => $documentId,
+            'student_id' => $studentId,
+            'penilaian_detail' => $penilaianDetail,
+            'catatan_tambahan' => $catatanTambahan,
+            'created_by' => $userId,
+        ];
+
+        try {
+            if ($existing) {
+                // Update
+                $this->penilaianModel->update($existing['id'], $data);
+            } else {
+                // Insert
+                $this->penilaianModel->insert($data);
+            }
+
+            return $this->response->setJSON([
+                'success' => true,
+                'message' => 'Penilaian berhasil disimpan.'
+            ]);
+        } catch (\Exception $e) {
+            log_message('error', 'Save penilaian error: ' . $e->getMessage());
+            return $this->response->setJSON([
+                'success' => false,
+                'message' => 'Gagal menyimpan penilaian: ' . $e->getMessage()
+            ]);
+        }
+    }
+
+    /**
+     * Get Rubrik for Penilaian (NEW - for batch penilaian)
+     */
+    /**
+     * Get Rubrik for Batch Penilaian (NEW - for batch penilaian)
+     */
+    public function getRubrik($documentId)
+    {
+        if (!$this->request->isAJAX()) {
+            return redirect()->back();
+        }
+
+        try {
+            log_message('info', '=== GET RUBRIK START === Document ID: ' . $documentId);
+            
+            // Check if rubrik needs regeneration (missing sub_dimensi)
+            $rubrik = $this->rubrikModel->getRubrikByDocument($documentId);
+            
+            log_message('info', 'Rubrik count: ' . count($rubrik));
+            
+            // Check if any rubrik is missing sub_dimensi
+            $needsRegeneration = false;
+            $missingCount = 0;
+            foreach ($rubrik as $r) {
+                if (empty($r['sub_dimensi'])) {
+                    $needsRegeneration = true;
+                    $missingCount++;
+                    log_message('info', 'Rubrik ID ' . $r['id'] . ' missing sub_dimensi');
+                }
+            }
+            
+            log_message('info', 'Needs regeneration: ' . ($needsRegeneration ? 'YES' : 'NO') . ', Missing count: ' . $missingCount);
+            
+            // If needs regeneration, delete and regenerate
+            if ($needsRegeneration) {
+                log_message('info', 'Starting rubrik regeneration for document: ' . $documentId);
+                
+                // Delete old rubrik
+                $deleted = $this->rubrikModel->where('document_id', $documentId)->delete();
+                log_message('info', 'Deleted old rubrik, affected rows: ' . $deleted);
+                
+                // Regenerate
+                $generated = $this->rubrikModel->generateRubrikFromDocument($documentId);
+                log_message('info', 'Generate result: ' . ($generated ? 'SUCCESS' : 'FAILED'));
+                
+                // Reload rubrik
+                $rubrik = $this->rubrikModel->getRubrikByDocument($documentId);
+                log_message('info', 'Reloaded rubrik count: ' . count($rubrik));
+                
+                // Log first item for verification
+                if (count($rubrik) > 0) {
+                    log_message('info', 'First rubrik item: ' . json_encode($rubrik[0]));
+                }
+            }
+            
+            log_message('info', '=== GET RUBRIK END === Returning ' . count($rubrik) . ' items');
+            
+            return $this->response->setJSON([
+                'success' => true,
+                'rubrik' => $rubrik,
+                'regenerated' => $needsRegeneration
+            ]);
+        } catch (\Exception $e) {
+            log_message('error', 'GET RUBRIK ERROR: ' . $e->getMessage());
+            log_message('error', 'Stack trace: ' . $e->getTraceAsString());
+            
+            return $this->response->setJSON([
+                'success' => false,
+                'message' => $e->getMessage()
+            ]);
+        }
+    }
+
+    /**
+     * TEST ENDPOINT - to verify routing works
+     */
+    public function testAjax()
+    {
+        return $this->response->setJSON([
+            'success' => true,
+            'message' => 'Test endpoint works!',
+            'timestamp' => date('Y-m-d H:i:s')
+        ]);
+    }
+
+    /**
+     * Get Students and Penilaian Data for specific rubrik (NEW - for batch penilaian)
+     */
+    public function getStudentsPenilaian($documentId, $rubrikId)
+    {
+        // IMMEDIATE RESPONSE TEST - to confirm method is reached
+        file_put_contents(WRITEPATH . 'logs/debug_ajax.txt', date('Y-m-d H:i:s') . " - Method called with doc=$documentId, rubrik=$rubrikId\n", FILE_APPEND);
+        
+        // Force logging with error_log to bypass any log level filtering
+        error_log('=== KOKURIKULER GET STUDENTS PENILAIAN CALLED ===');
+        error_log('Document ID: ' . $documentId . ', Rubrik ID: ' . $rubrikId);
+        
+        // Check if AJAX
+        $isAjax = $this->request->isAJAX();
+        $hasXHR = $this->request->getHeaderLine('X-Requested-With') === 'XMLHttpRequest';
+        file_put_contents(WRITEPATH . 'logs/debug_ajax.txt', "  - isAJAX(): " . ($isAjax ? 'true' : 'false') . "\n", FILE_APPEND);
+        file_put_contents(WRITEPATH . 'logs/debug_ajax.txt', "  - X-Requested-With: " . $this->request->getHeaderLine('X-Requested-With') . "\n", FILE_APPEND);
+        
+        // TEMPORARILY DISABLE AJAX CHECK FOR DEBUGGING
+        // if (!$this->request->isAJAX()) {
+        //     error_log('Not AJAX request, redirecting');
+        //     file_put_contents(WRITEPATH . 'logs/debug_ajax.txt', "  - Not AJAX, redirecting\n", FILE_APPEND);
+        //     return redirect()->back();
+        // }
+        
+        file_put_contents(WRITEPATH . 'logs/debug_ajax.txt', "  - Proceeding with query\n", FILE_APPEND);
+
+        try {
+            $document = $this->documentModel->find($documentId);
+            error_log('Document found: ' . json_encode($document));
+            file_put_contents(WRITEPATH . 'logs/debug_ajax.txt', "  - Document: " . json_encode($document) . "\n", FILE_APPEND);
+            
+            if (!$document) {
+                error_log('Document not found!');
+                return $this->response->setJSON([
+                    'success' => false,
+                    'message' => 'Dokumen tidak ditemukan'
+                ]);
+            }
+
+            log_message('info', '=== GET STUDENTS PENILAIAN START ===');
+            log_message('info', 'Document ID: ' . $documentId);
+            log_message('info', 'Rubrik ID: ' . $rubrikId);
+            log_message('info', 'Document class_id: ' . ($document['class_id'] ?? 'NULL'));
+            log_message('info', 'Document year_id: ' . ($document['year_id'] ?? 'NULL'));
+            
+            error_log('Document class_id: ' . ($document['class_id'] ?? 'NULL'));
+            error_log('Document year_id: ' . ($document['year_id'] ?? 'NULL'));
+
+            // Get students
+            $db = \Config\Database::connect();
+            $students = [];
+
+            if (!empty($document['class_id'])) {
+                log_message('info', 'Querying students for class_id: ' . $document['class_id']);
+                log_message('info', 'Query parameters: class_id=' . $document['class_id'] . ', academic_year_id=' . $document['year_id'] . ', status=aktif');
+                
+                // Specific class - get students from student_records
+                $builder = $db->table('students')
+                    ->select('students.id, students.nis, students.name, classes.name as class_name')
+                    ->join('student_records', 'student_records.student_id = students.id')
+                    ->join('classes', 'classes.id = student_records.class_id')
+                    ->where('student_records.class_id', $document['class_id'])
+                    ->where('student_records.academic_year_id', $document['year_id'])
+                    ->where('student_records.status', 'aktif') // Status dalam bahasa Indonesia
+                    ->orderBy('students.name', 'ASC');
+                
+                // Log the SQL query
+                $sql = $builder->getCompiledSelect(false);
+                log_message('info', 'SQL Query: ' . $sql);
+                
+                $students = $builder->get()->getResultArray();
+                
+                log_message('info', 'Students found: ' . count($students));
+                
+                // If no students found, try without status filter to debug
+                if (count($students) === 0) {
+                    log_message('info', 'No students found with status filter, trying without status...');
+                    $studentsNoStatus = $db->table('students')
+                        ->select('students.id, students.nis, students.name, student_records.status')
+                        ->join('student_records', 'student_records.student_id = students.id')
+                        ->where('student_records.class_id', $document['class_id'])
+                        ->where('student_records.academic_year_id', $document['year_id'])
+                        ->get()
+                        ->getResultArray();
+                    log_message('info', 'Students without status filter: ' . count($studentsNoStatus));
+                    if (count($studentsNoStatus) > 0) {
+                        log_message('info', 'Sample student status values: ' . json_encode(array_column($studentsNoStatus, 'status')));
+                    }
+                }
+            } else {
+                log_message('info', 'Document has no class_id - cannot get students');
+            }
+
+            // Get existing penilaian for this rubrik
+            $penilaianData = [];
+            $existingPenilaian = $db->table('kokurikuler_penilaian')
+                ->where('document_id', $documentId)
+                ->get()
+                ->getResultArray();
+
+            foreach ($existingPenilaian as $p) {
+                $detail = json_decode($p['penilaian_detail'], true) ?: [];
+                // Check both string and int key versions
+                if (isset($detail[$rubrikId]) || isset($detail[(int)$rubrikId])) {
+                    $capaian = $detail[$rubrikId] ?? $detail[(int)$rubrikId];
+                    $penilaianData[(int)$p['student_id']] = [
+                        'capaian' => $capaian,
+                        'catatan' => $p['catatan_tambahan'] ?? ''
+                    ];
+                }
+            }
+            
+            // Convert to JSON object (not array) so JS can use numeric keys
+            $penilaianDataObj = (object)$penilaianData;
+
+            log_message('info', 'Existing penilaian records: ' . count($existingPenilaian));
+            log_message('info', 'Penilaian data for rubrik ' . $rubrikId . ': ' . count($penilaianData));
+            log_message('info', '=== GET STUDENTS PENILAIAN END ===');
+            
+            error_log('Returning response: students=' . count($students) . ', penilaian_data=' . count($penilaianData));
+
+            return $this->response->setJSON([
+                'success' => true,
+                'students' => $students,
+                'penilaian_data' => $penilaianDataObj,
+                'debug' => [
+                    'document_id' => $documentId,
+                    'rubrik_id' => $rubrikId,
+                    'class_id' => $document['class_id'] ?? null,
+                    'year_id' => $document['year_id'] ?? null,
+                    'students_count' => count($students),
+                    'penilaian_count' => count($penilaianData)
+                ]
+            ]);
+        } catch (\Exception $e) {
+            log_message('error', 'Get students penilaian error: ' . $e->getMessage());
+            return $this->response->setJSON([
+                'success' => false,
+                'message' => $e->getMessage()
+            ]);
+        }
+    }
+
+    /**
+     * Save Batch Penilaian (NEW - for batch penilaian)
+     */
+    public function saveBatchPenilaian()
+    {
+        if (!$this->request->isAJAX()) {
+            return redirect()->back();
+        }
+
+        $user = session()->get('user');
+        $userId = $user['id'] ?? 0;
+
+        $documentId = $this->request->getPost('document_id');
+        $rubrikId = $this->request->getPost('rubrik_id');
+        $penilaianListJson = $this->request->getPost('penilaian_list');
+
+        if (!$documentId || !$rubrikId || !$penilaianListJson) {
+            return $this->response->setJSON([
+                'success' => false,
+                'message' => 'Data tidak lengkap'
+            ]);
+        }
+
+        try {
+            $penilaianList = json_decode($penilaianListJson, true);
+            
+            foreach ($penilaianList as $item) {
+                $studentId = $item['student_id'];
+                $capaian = $item['capaian'];
+                $catatan = $item['catatan'] ?? '';
+
+                // Check if penilaian exists
+                $existing = $this->penilaianModel
+                    ->where('document_id', $documentId)
+                    ->where('student_id', $studentId)
+                    ->first();
+
+                if ($existing) {
+                    // Update existing
+                    $existingDetail = json_decode($existing['penilaian_detail'], true);
+                    $existingDetail[$rubrikId] = $capaian;
+
+                    $this->penilaianModel->update($existing['id'], [
+                        'penilaian_detail' => json_encode($existingDetail),
+                        'catatan_tambahan' => $catatan,
+                        'updated_at' => date('Y-m-d H:i:s')
+                    ]);
+                } else {
+                    // Insert new
+                    $penilaianDetail = [$rubrikId => $capaian];
+
+                    $this->penilaianModel->insert([
+                        'document_id' => $documentId,
+                        'student_id' => $studentId,
+                        'penilaian_detail' => json_encode($penilaianDetail),
+                        'catatan_tambahan' => $catatan,
+                        'created_by' => $userId,
+                        'created_at' => date('Y-m-d H:i:s'),
+                        'updated_at' => date('Y-m-d H:i:s')
+                    ]);
+                }
+            }
+
+            return $this->response->setJSON([
+                'success' => true,
+                'message' => 'Penilaian berhasil disimpan untuk semua siswa'
+            ]);
+        } catch (\Exception $e) {
+            log_message('error', 'Save batch penilaian error: ' . $e->getMessage());
+            return $this->response->setJSON([
+                'success' => false,
+                'message' => 'Gagal menyimpan penilaian: ' . $e->getMessage()
+            ]);
+        }
+    }
+
+    /**
+     * Penilaian Deskripsi - Generate deskripsi naratif per siswa
+     */
+    public function penilaianDeskripsi($documentId)
+    {
+        $user = session()->get('user');
+        $roleId = $user['role_id'] ?? 0;
+        if (!in_array($roleId, [1, 3])) {
+            return redirect()->back()->with('error', 'Akses ditolak.');
+        }
+
+        $document = $this->documentModel->getDocumentWithDetails($documentId);
+        if (!$document) {
+            return redirect()->back()->with('error', 'Dokumen tidak ditemukan.');
+        }
+
+        $db = \Config\Database::connect();
+        $rubrik = $db->table('kokurikuler_rubrik')
+            ->where('document_id', $documentId)
+            ->orderBy('dimensi_profil', 'ASC')
+            ->get()->getResultArray();
+
+        // Get students with penilaian
+        $studentsWithPenilaian = $this->_getStudentsWithFullPenilaian($documentId, $document, $db);
+
+        // Generate deskripsi for each student
+        foreach ($studentsWithPenilaian as &$student) {
+            $student['deskripsi'] = $this->_generateDeskripsi($student, $document, $rubrik);
+        }
+
+        return view('admin/kokurikuler/penilaian_deskripsi', [
+            'title' => 'Deskripsi Penilaian - ' . $document['tema'],
+            'document' => $document,
+            'rubrik' => $rubrik,
+            'students' => $studentsWithPenilaian,
+        ]);
+    }
+
+    /**
+     * Penilaian Cetak - Print view
+     */
+    public function penilaianCetak($documentId)
+    {
+        $user = session()->get('user');
+        $roleId = $user['role_id'] ?? 0;
+        if (!in_array($roleId, [1, 3])) {
+            return redirect()->back()->with('error', 'Akses ditolak.');
+        }
+
+        $document = $this->documentModel->getDocumentWithDetails($documentId);
+        if (!$document) {
+            return redirect()->back()->with('error', 'Dokumen tidak ditemukan.');
+        }
+
+        $db = \Config\Database::connect();
+        $rubrik = $db->table('kokurikuler_rubrik')
+            ->where('document_id', $documentId)
+            ->orderBy('dimensi_profil', 'ASC')
+            ->get()->getResultArray();
+
+        $studentsWithPenilaian = $this->_getStudentsWithFullPenilaian($documentId, $document, $db);
+
+        foreach ($studentsWithPenilaian as &$student) {
+            $student['deskripsi'] = $this->_generateDeskripsi($student, $document, $rubrik);
+        }
+
+        return view('admin/kokurikuler/penilaian_cetak', [
+            'title' => 'Cetak Penilaian - ' . $document['tema'],
+            'document' => $document,
+            'rubrik' => $rubrik,
+            'students' => $studentsWithPenilaian,
+        ]);
+    }
+
+    /**
+     * Helper: Get students with full penilaian data
+     */
+    private function _getStudentsWithFullPenilaian($documentId, $document, $db)
+    {
+        $yearModel = new \App\Models\AcademicYearModel();
+        $activeYear = $yearModel->getActiveYear();
+
+        $query = $db->table('students')
+            ->select('students.id, students.nis, students.name, classes.name as class_name')
+            ->join('student_records', 'student_records.student_id = students.id')
+            ->join('classes', 'classes.id = student_records.class_id')
+            ->where('student_records.academic_year_id', $activeYear['id'])
+            ->where('student_records.status', 'aktif');
+
+        if (!empty($document['class_id'])) {
+            $query->where('student_records.class_id', $document['class_id']);
+        } else {
+            $levelKelas = $document['level_kelas'];
+            if (strpos($levelKelas, ',') !== false) {
+                $query->whereIn('classes.level', array_map('trim', explode(',', $levelKelas)));
+            } else {
+                $query->where('classes.level', $levelKelas);
+            }
+        }
+
+        $students = $query->orderBy('students.name', 'ASC')->get()->getResultArray();
+
+        // Attach penilaian detail
+        $penilaianRows = $db->table('kokurikuler_penilaian')
+            ->where('document_id', $documentId)
+            ->get()->getResultArray();
+
+        $penilaianMap = [];
+        foreach ($penilaianRows as $p) {
+            $penilaianMap[$p['student_id']] = json_decode($p['penilaian_detail'], true) ?: [];
+        }
+
+        foreach ($students as &$student) {
+            $student['penilaian_detail'] = $penilaianMap[$student['id']] ?? [];
+        }
+
+        return $students;
+    }
+
+    /**
+     * Helper: Generate deskripsi naratif for a student
+     */
+    private function _generateDeskripsi($student, $document, $rubrik)
+    {
+        $capaianLabel = [
+            'Berkembang' => 'berkembang',
+            'Cakap'      => 'cakap',
+            'Mahir'      => 'mahir',
+        ];
+
+        $kegiatan = $document['bentuk_kegiatan_konkret'] ?: $document['tema'];
+        $detail = $student['penilaian_detail'];
+
+        // Count capaian values to determine overall label
+        $counts = ['Berkembang' => 0, 'Cakap' => 0, 'Mahir' => 0];
+        foreach ($rubrik as $r) {
+            $capaian = $detail[(string)$r['id']] ?? null;
+            if ($capaian && isset($counts[$capaian])) {
+                $counts[$capaian]++;
+            }
+        }
+
+        // Determine overall capaian: majority wins; tie goes to higher
+        if ($counts['Mahir'] >= $counts['Cakap'] && $counts['Mahir'] >= $counts['Berkembang']) {
+            $overallLabel = 'sangat baik';
+        } elseif ($counts['Cakap'] >= $counts['Berkembang']) {
+            $overallLabel = 'baik';
+        } else {
+            $overallLabel = 'cukup baik';
+        }
+
+        $deskripsi = "Pada semester ini, ananda {$student['name']} menunjukkan capaian yang {$overallLabel} dalam penguatan profil lulusan, "
+            . "yang ditunjukkan melalui kegiatan kokurikuler {$kegiatan}.";
+
+        foreach ($rubrik as $r) {
+            $rubrikId = (string)$r['id'];
+            $capaian = $detail[$rubrikId] ?? null;
+            if (!$capaian) continue;
+
+            $label = $capaianLabel[$capaian] ?? strtolower($capaian);
+            $dimensi = strtolower($r['dimensi_profil']);
+            $subDimensi = strtolower($r['sub_dimensi']);
+
+            $deskripsi .= " Pada dimensi {$dimensi}, ananda {$label} dalam subdimensi {$subDimensi}.";
+        }
+
+        return $deskripsi;
+    }
+
+    /**
+     * Pelaporan - Rekap semua dokumen selesai dengan refleksi & rekomendasi
+     */
+    public function pelaporan()
+    {
+        $user = session()->get('user');
+        $roleId = $user['role_id'] ?? 0;
+        $userId = $user['id'] ?? 0;
+
+        // Admin, Kepsek, dan Guru Kelas bisa akses
+        if (!in_array($roleId, [1, 2, 3])) {
+            return redirect()->back()->with('error', 'Anda tidak memiliki akses ke modul ini.');
+        }
+
+        $db = \Config\Database::connect();
+
+        // Get completed documents with 100% penilaian
+        $docsQuery = $this->documentModel
+            ->select('kokurikuler_documents.*, academic_years.year as year_name')
+            ->join('academic_years', 'academic_years.id = kokurikuler_documents.year_id', 'left')
+            ->where('kokurikuler_documents.status', 'completed');
+
+        if ($roleId == 3) {
+            $userRecord = $db->table('users')->where('id', $userId)->get()->getRow();
+            $teacherId = $userRecord->related_id ?? 0;
+            $docsQuery->groupStart()
+                ->where('kokurikuler_documents.created_by', $userId)
+                ->orWhere('kokurikuler_documents.used_by_teacher_id', $teacherId)
+                ->groupEnd();
+        }
+        // Kepsek bisa lihat semua (tidak perlu filter)
+
+        $allDocs = $docsQuery->orderBy('kokurikuler_documents.created_at', 'DESC')->findAll();
+
+        // Filter only 100% assessed and attach data
+        $documents = [];
+        foreach ($allDocs as $doc) {
+            $summary = $this->penilaianModel->getSummary($doc['id']);
+            if ($summary['persentase'] < 100) continue;
+
+            $rubrik = $db->table('kokurikuler_rubrik')
+                ->where('document_id', $doc['id'])
+                ->orderBy('dimensi_profil', 'ASC')
+                ->get()->getResultArray();
+
+            $students = $this->_getStudentsWithFullPenilaian($doc['id'], $doc, $db);
+            foreach ($students as &$s) {
+                $s['deskripsi'] = $this->_generateDeskripsi($s, $doc, $rubrik);
+            }
+
+            $laporan = $db->table('kokurikuler_laporan')
+                ->where('document_id', $doc['id'])
+                ->get()->getRowArray();
+
+            $doc['rubrik']    = $rubrik;
+            $doc['students']  = $students;
+            $doc['summary']   = $summary;
+            $doc['laporan']   = $laporan;
+            $documents[] = $doc;
+        }
+
+        return view('admin/kokurikuler/pelaporan', [
+            'title'     => 'Pelaporan Kokurikuler',
+            'documents' => $documents,
+            'roleId'    => $roleId,
+            'isReadOnly' => ($roleId == 2), // Kepsek read-only
+        ]);
+    }
+
+    /**
+     * Save Refleksi & Rekomendasi
+     */
+    public function saveLaporan()
+    {
+        if (!$this->request->isAJAX()) {
+            return redirect()->back();
+        }
+
+        $user   = session()->get('user');
+        $userId = $user['id'] ?? 0;
+        $roleId = $user['role_id'] ?? 0;
+
+        if (!in_array($roleId, [1, 3])) {
+            return $this->response->setJSON(['success' => false, 'message' => 'Akses ditolak']);
+        }
+
+        $documentId  = $this->request->getPost('document_id');
+        $refleksi    = $this->request->getPost('refleksi');
+        $rekomendasi = $this->request->getPost('rekomendasi');
+
+        if (!$documentId) {
+            return $this->response->setJSON(['success' => false, 'message' => 'Document ID tidak valid']);
+        }
+
+        try {
+            $db       = \Config\Database::connect();
+            $existing = $db->table('kokurikuler_laporan')->where('document_id', $documentId)->get()->getRowArray();
+
+            $data = [
+                'refleksi'    => $refleksi,
+                'rekomendasi' => $rekomendasi,
+                'updated_at'  => date('Y-m-d H:i:s'),
+            ];
+
+            if ($existing) {
+                $db->table('kokurikuler_laporan')->where('document_id', $documentId)->update($data);
+            } else {
+                $data['document_id'] = $documentId;
+                $data['created_by']  = $userId;
+                $data['created_at']  = date('Y-m-d H:i:s');
+                $db->table('kokurikuler_laporan')->insert($data);
+            }
+
+            return $this->response->setJSON(['success' => true, 'message' => 'Laporan berhasil disimpan']);
+        } catch (\Exception $e) {
+            return $this->response->setJSON(['success' => false, 'message' => $e->getMessage()]);
+        }
+    }
+
+    /**
+     * Pelaporan Cetak - Print all documents
+     */
+    public function pelaporanCetak()
+    {
+        $user   = session()->get('user');
+        $roleId = $user['role_id'] ?? 0;
+        $userId = $user['id'] ?? 0;
+
+        if (!in_array($roleId, [1, 3])) {
+            return redirect()->back()->with('error', 'Akses ditolak.');
+        }
+
+        $db = \Config\Database::connect();
+
+        $docsQuery = $this->documentModel
+            ->select('kokurikuler_documents.*, academic_years.year as year_name')
+            ->join('academic_years', 'academic_years.id = kokurikuler_documents.year_id', 'left')
+            ->where('kokurikuler_documents.status', 'completed');
+
+        if ($roleId == 3) {
+            $userRecord = $db->table('users')->where('id', $userId)->get()->getRow();
+            $teacherId  = $userRecord->related_id ?? 0;
+            $docsQuery->groupStart()
+                ->where('kokurikuler_documents.created_by', $userId)
+                ->orWhere('kokurikuler_documents.used_by_teacher_id', $teacherId)
+                ->groupEnd();
+        }
+
+        $allDocs = $docsQuery->orderBy('kokurikuler_documents.created_at', 'DESC')->findAll();
+
+        $documents = [];
+        foreach ($allDocs as $doc) {
+            $summary = $this->penilaianModel->getSummary($doc['id']);
+            if ($summary['persentase'] < 100) continue;
+
+            $rubrik = $db->table('kokurikuler_rubrik')
+                ->where('document_id', $doc['id'])
+                ->orderBy('dimensi_profil', 'ASC')
+                ->get()->getResultArray();
+
+            $students = $this->_getStudentsWithFullPenilaian($doc['id'], $doc, $db);
+            foreach ($students as &$s) {
+                $s['deskripsi'] = $this->_generateDeskripsi($s, $doc, $rubrik);
+            }
+
+            $laporan = $db->table('kokurikuler_laporan')
+                ->where('document_id', $doc['id'])
+                ->get()->getRowArray();
+
+            $doc['rubrik']   = $rubrik;
+            $doc['students'] = $students;
+            $doc['laporan']  = $laporan;
+            $documents[] = $doc;
+        }
+
+        return view('admin/kokurikuler/pelaporan_cetak', [
+            'title'     => 'Cetak Laporan Kokurikuler',
+            'documents' => $documents,
+        ]);
+    }
+
+    /**
+     * Use Template - Wali Kelas menggunakan template dari Admin
+     */
+    public function useTemplate($templateId)
+    {
+        $user = session()->get('user');
+        $roleId = $user['role_id'] ?? 0;
+        $userId = $user['id'] ?? 0;
+
+        log_message('info', "UseTemplate called - Template ID: $templateId, User ID: $userId, Role ID: $roleId");
+
+        // Hanya wali kelas yang bisa menggunakan template
+        if ($roleId != 3) {
+            log_message('warning', "UseTemplate - Access denied: Not a wali kelas (role_id: $roleId)");
+            return redirect()->back()->with('error', 'Hanya wali kelas yang bisa menggunakan template.');
+        }
+
+        // Get template
+        $template = $this->documentModel->find($templateId);
+        
+        log_message('info', "UseTemplate - Template data: " . json_encode($template));
+        
+        if (!$template) {
+            log_message('error', "UseTemplate - Template not found: ID $templateId");
+            return redirect()->back()->with('error', 'Template tidak ditemukan. ID: ' . $templateId);
+        }
+
+        // Validasi: template harus sudah completed
+        if ($template['status'] !== 'completed') {
+            log_message('warning', "UseTemplate - Template not completed: Status = {$template['status']}");
+            return redirect()->back()->with('error', 'Template belum selesai. Hanya template yang sudah completed yang bisa digunakan.');
+        }
+
+        // Get teacher info
+        $teacherId = $user['related_id'] ?? 0;
+        $db = \Config\Database::connect();
+        
+        // Get kelas yang diwalikan
+        $waliClass = $db->table('classes')
+            ->where('teacher_id', $teacherId)
+            ->get()
+            ->getRow();
+        
+        if (!$waliClass) {
+            return redirect()->back()->with('error', 'Anda belum ditugaskan sebagai wali kelas.');
+        }
+
+        // Cek apakah level kelas sesuai dengan template
+        $templateLevelArray = explode(',', $template['level_kelas']);
+        if (!in_array($waliClass->level, $templateLevelArray)) {
+            return redirect()->back()->with('error', 'Template ini tidak sesuai dengan level kelas Anda.');
+        }
+
+        // Cek apakah sudah menggunakan template ini untuk semester dan tahun yang sama
+        $existing = $this->documentModel
+            ->where('class_id', $waliClass->id)
+            ->where('year_id', $template['year_id'])
+            ->where('semester', $template['semester'])
+            ->first();
+        
+        if ($existing) {
+            return redirect()->to('admin/kokurikuler/view/' . $existing['id'])
+                ->with('info', 'Anda sudah memiliki dokumen untuk semester ini.');
+        }
+
+        // Copy template untuk wali kelas
+        $newData = [
+            'year_id' => $template['year_id'],
+            'semester' => $template['semester'],
+            'fase' => $template['fase'],
+            'level_kelas' => (string)$waliClass->level, // Hanya level kelas wali kelas
+            'class_id' => $waliClass->id, // Assign kelas spesifik wali kelas
+            'jumlah_pertemuan' => $template['jumlah_pertemuan'],
+            'dimensi_profil' => $template['dimensi_profil'],
+            'tema' => $template['tema'],
+            'jenis_kokurikuler' => $this->getJenisKokurikuler($template),
+            'bentuk_kegiatan_konkret' => $template['bentuk_kegiatan_konkret'] ?? '',
+            'kegiatan_detail' => $template['kegiatan_detail'],
+            'tujuan_pembelajaran' => $template['tujuan_pembelajaran'],
+            'praktik_pedagogis' => $template['praktik_pedagogis'],
+            'lingkungan_belajar' => $template['lingkungan_belajar'],
+            'kemitraan' => $template['kemitraan'],
+            'teknologi_digital' => $template['teknologi_digital'],
+            'kegiatan_kokurikuler' => $template['kegiatan_kokurikuler'],
+            'status' => $template['status'],
+            'is_template' => 0,
+            'parent_id' => $templateId,
+            'used_by_teacher_id' => $teacherId,
+            'created_by' => $userId,
+        ];
+
+        try {
+            $newId = $this->documentModel->insert($newData);
+            return redirect()->to('admin/kokurikuler/view/' . $newId)
+                ->with('success', 'Template berhasil digunakan. Dokumen ini akan menggunakan tanda tangan Anda saat export PDF.');
+        } catch (\Exception $e) {
+            log_message('error', 'Use template error: ' . $e->getMessage());
+            return redirect()->back()->with('error', 'Gagal menggunakan template: ' . $e->getMessage());
+        }
+    }
+
+    /**
+     * Activate Old Plan - Aktifkan rencana lama ke tahun ajaran baru
+     */
+    public function activateOldPlan($oldDocId)
+    {
+        $user = session()->get('user');
+        $roleId = $user['role_id'] ?? 0;
+        $userId = $user['id'] ?? 0;
+
+        if (!in_array($roleId, [1, 3])) {
+            return redirect()->back()->with('error', 'Anda tidak memiliki akses.');
+        }
+
+        // Get old document
+        $oldDoc = $this->documentModel->find($oldDocId);
+        if (!$oldDoc) {
+            return redirect()->back()->with('error', 'Dokumen tidak ditemukan.');
+        }
+
+        // Check ownership for guru kelas
+        if ($roleId == 3 && $oldDoc['created_by'] != $userId && $oldDoc['used_by_teacher_id'] != ($user['related_id'] ?? 0)) {
+            return redirect()->back()->with('error', 'Anda tidak memiliki akses ke dokumen ini.');
+        }
+
+        // Get active year
+        $activeYear = $this->yearModel->getActiveYear();
+        if (!$activeYear) {
+            return redirect()->back()->with('error', 'Tidak ada tahun ajaran aktif.');
+        }
+
+        // Cek apakah sudah ada rencana untuk semester dan level ini di tahun aktif
+        $existing = $this->documentModel
+            ->where('year_id', $activeYear['id'])
+            ->where('semester', $oldDoc['semester'])
+            ->where('level_kelas', $oldDoc['level_kelas'])
+            ->first();
+        
+        if ($existing) {
+            return redirect()->back()->with('error', 'Sudah ada rencana untuk semester dan level ini di tahun ajaran aktif.');
+        }
+
+        // Copy document to new year
+        $newData = [
+            'year_id' => $activeYear['id'],
+            'semester' => $oldDoc['semester'],
+            'fase' => $oldDoc['fase'],
+            'level_kelas' => $oldDoc['level_kelas'],
+            'jumlah_pertemuan' => $oldDoc['jumlah_pertemuan'],
+            'dimensi_profil' => $oldDoc['dimensi_profil'],
+            'tema' => $oldDoc['tema'],
+            'jenis_kokurikuler' => $this->getJenisKokurikuler($oldDoc),
+            'bentuk_kegiatan_konkret' => $oldDoc['bentuk_kegiatan_konkret'] ?? '',
+            'kegiatan_detail' => $oldDoc['kegiatan_detail'],
+            'tujuan_pembelajaran' => $oldDoc['tujuan_pembelajaran'],
+            'praktik_pedagogis' => $oldDoc['praktik_pedagogis'],
+            'lingkungan_belajar' => $oldDoc['lingkungan_belajar'],
+            'kemitraan' => $oldDoc['kemitraan'],
+            'teknologi_digital' => $oldDoc['teknologi_digital'],
+            'kegiatan_kokurikuler' => $oldDoc['kegiatan_kokurikuler'],
+            'status' => $oldDoc['status'],
+            'is_template' => $oldDoc['is_template'],
+            'parent_id' => $oldDocId,
+            'used_by_teacher_id' => $oldDoc['used_by_teacher_id'],
+            'created_by' => $userId,
+        ];
+
+        try {
+            $newId = $this->documentModel->insert($newData);
+            return redirect()->to('admin/kokurikuler/view/' . $newId)
+                ->with('success', 'Rencana berhasil diaktifkan untuk tahun ajaran ' . $activeYear['year']);
+        } catch (\Exception $e) {
+            log_message('error', 'Activate old plan error: ' . $e->getMessage());
+            return redirect()->back()->with('error', 'Gagal mengaktifkan rencana: ' . $e->getMessage());
+        }
+    }
+
+    /**
+     * Get Available Templates - AJAX untuk wali kelas
+     */
+    public function getAvailableTemplates()
+    {
+        if (!$this->request->isAJAX()) {
+            return $this->response->setJSON(['success' => false]);
+        }
+
+        $user = session()->get('user');
+        $roleId = $user['role_id'] ?? 0;
+
+        if ($roleId != 3) {
+            return $this->response->setJSON(['success' => false, 'message' => 'Akses ditolak']);
+        }
+
+        $teacherId = $user['related_id'] ?? 0;
+        $db = \Config\Database::connect();
+        
+        // Get kelas yang diwalikan
+        $waliClass = $db->table('classes')
+            ->where('teacher_id', $teacherId)
+            ->get()
+            ->getRow();
+        
+        if (!$waliClass) {
+            return $this->response->setJSON(['success' => false, 'message' => 'Anda belum ditugaskan sebagai wali kelas']);
+        }
+
+        // Get active year
+        $activeYear = $this->yearModel->getActiveYear();
+
+        log_message('info', "=== GET AVAILABLE TEMPLATES START ===");
+        log_message('info', "Teacher ID: {$teacherId}");
+        log_message('info', "Wali Class ID: {$waliClass->id}, Name: {$waliClass->name}, Level: {$waliClass->level}");
+        log_message('info', "Active Year ID: {$activeYear['id']}, Year: {$activeYear['year']}");
+
+        // Get dokumen yang sudah digunakan wali kelas ini
+        $usedTemplateIds = $this->documentModel
+            ->select('parent_id')
+            ->where('used_by_teacher_id', $teacherId)
+            ->where('year_id', $activeYear['id'])
+            ->findAll();
+        
+        $usedIds = array_filter(array_column($usedTemplateIds, 'parent_id'));
+        
+        log_message('info', "Used template IDs by this teacher: " . json_encode($usedIds));
+        
+        // Get ALL documents first for debugging
+        $allDocs = $this->documentModel
+            ->select('id, tema, class_id, status, level_kelas, year_id, created_by')
+            ->where('year_id', $activeYear['id'])
+            ->findAll();
+        
+        log_message('info', "Total documents in active year: " . count($allDocs));
+        foreach ($allDocs as $doc) {
+            $isTemplate = is_null($doc['class_id']) || $doc['class_id'] === '';
+            $isCompleted = $doc['status'] === 'completed';
+            $levelMatch = strpos($doc['level_kelas'], (string)$waliClass->level) !== false;
+            
+            log_message('info', "Doc ID {$doc['id']}: tema='{$doc['tema']}', class_id=" . ($doc['class_id'] ?? 'NULL') . 
+                ", status={$doc['status']}, level_kelas={$doc['level_kelas']}, " .
+                "isTemplate=" . ($isTemplate ? 'YES' : 'NO') . 
+                ", isCompleted=" . ($isCompleted ? 'YES' : 'NO') . 
+                ", levelMatch=" . ($levelMatch ? 'YES' : 'NO'));
+        }
+        
+        // Get templates yang sesuai dengan level kelas wali kelas
+        $builder = $this->documentModel
+            ->select('kokurikuler_documents.*, users.fullname as creator_name')
+            ->join('users', 'users.id = kokurikuler_documents.created_by', 'left')
+            ->where('kokurikuler_documents.year_id', $activeYear['id'])
+            ->where('kokurikuler_documents.status', 'completed')
+            ->where('kokurikuler_documents.class_id IS NULL', null, false) // HANYA template umum
+            ->like('kokurikuler_documents.level_kelas', (string)$waliClass->level);
+        
+        // Exclude template yang sudah digunakan
+        if (!empty($usedIds)) {
+            $builder->whereNotIn('kokurikuler_documents.id', $usedIds);
+        }
+        
+        $templates = $builder->orderBy('kokurikuler_documents.created_at', 'DESC')
+            ->findAll();
+
+        log_message('info', "Templates found after filter: " . count($templates));
+        foreach ($templates as $t) {
+            log_message('info', "Template ID {$t['id']}: tema='{$t['tema']}', creator={$t['creator_name']}, level={$t['level_kelas']}");
+        }
+        log_message('info', "=== GET AVAILABLE TEMPLATES END ===");
+
+        return $this->response->setJSON([
+            'success' => true,
+            'data' => $templates
+        ]);
+    }
+
+    /**
+     * Regenerate Rubrik (Manual Fix for missing sub_dimensi)
+     */
+    public function regenerateRubrik($documentId)
+    {
+        $user = session()->get('user');
+        $roleId = $user['role_id'] ?? 0;
+
+        if (!in_array($roleId, [1, 3])) {
+            return redirect()->to('/')->with('error', 'Akses ditolak');
+        }
+
+        try {
+            log_message('info', '=== MANUAL REGENERATE RUBRIK === Document ID: ' . $documentId);
+            
+            // Check if document exists
+            $document = $this->documentModel->find($documentId);
+            if (!$document) {
+                return redirect()->back()->with('error', 'Dokumen tidak ditemukan');
+            }
+            
+            // Delete old rubrik
+            $deleted = $this->rubrikModel->where('document_id', $documentId)->delete();
+            log_message('info', 'Deleted old rubrik, affected rows: ' . $deleted);
+            
+            // Regenerate
+            $generated = $this->rubrikModel->generateRubrikFromDocument($documentId);
+            log_message('info', 'Generate result: ' . ($generated ? 'SUCCESS' : 'FAILED'));
+            
+            if ($generated) {
+                // Verify sub_dimensi exists
+                $rubrik = $this->rubrikModel->getRubrikByDocument($documentId);
+                $hasSubDimensi = false;
+                foreach ($rubrik as $r) {
+                    if (!empty($r['sub_dimensi'])) {
+                        $hasSubDimensi = true;
+                        break;
+                    }
+                }
+                
+                if ($hasSubDimensi) {
+                    return redirect()->to('admin/kokurikuler/view/' . $documentId)
+                        ->with('success', 'Rubrik berhasil di-regenerate dengan sub dimensi! Total: ' . count($rubrik) . ' rubrik.');
+                } else {
+                    return redirect()->to('admin/kokurikuler/view/' . $documentId)
+                        ->with('warning', 'Rubrik di-regenerate tapi sub_dimensi masih kosong. Periksa kegiatan_detail dokumen.');
+                }
+            } else {
+                return redirect()->back()->with('error', 'Gagal regenerate rubrik. Cek log server.');
+            }
+            
+        } catch (\Exception $e) {
+            log_message('error', 'Regenerate rubrik error: ' . $e->getMessage());
+            return redirect()->back()->with('error', 'Error: ' . $e->getMessage());
+        }
+    }
+}
+
